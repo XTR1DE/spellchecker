@@ -1,0 +1,63 @@
+Root Cause
+PyJWT 2.13.0 introduced a guard in HMACAlgorithm.prepare_key() (file jwt/algorithms.py, approximately line 344) to prevent RSA public key material from being used as an HMAC secret — the root cause of CVE-2026-48526.
+
+The guard uses bytes.lstrip() before calling startswith(b"{"):
+
+stripped = key_bytes.lstrip() # strips ASCII whitespace only
+if stripped.startswith(b"{"): # JWK detection
+ ...
+ raise InvalidKeyError("The specified key is an asymmetric key...")
+bytes.lstrip() with no argument removes only bytes in the ASCII whitespace set (\x20 \t \n \r \x0b \x0c). A UTF-8 BOM prefix (\xef\xbb\xbf) is not stripped, so stripped.startswith(b"{") returns False for any BOM-prefixed JWK JSON. The JWK detection block is never entered, and the RSA public key bytes are silently accepted as the HMAC-SHA256 secret.
+
+PoC Sketch (pseudocode — not a weaponized payload)
+# 1. Attacker obtains RSA public key JWK (e.g., from /jwks.json endpoint)
+# and prepends a UTF-8 BOM byte sequence before the JSON opening brace.
+# 2. Attacker signs a JWT using HS256, with the BOM-prefixed JWK as the secret.
+# 3. Attacker submits the forged token to a verifier that:
+# - accepts algorithms=["HS256", "RS256"]
+# - holds the same RSA public key as raw bytes (BOM-prefixed key file)
+# 4. PyJWT 2.13.0 accepts the token because the BOM causes the JWK
+# detection check to be skipped — the RSA JWK bytes become a valid HMAC key.
+# Result: arbitrary claims (role, sub, etc.) accepted by the verifier.
+Impact
+An unauthenticated network attacker who knows the target application's RSA public key — which is public by design and obtainable from a JWKS endpoint or certificate — can forge JWT tokens containing arbitrary claims and have them accepted by a PyJWT 2.13.0 verifier configured with a mixed algorithm set (algorithms=["HS256", "RS256"] or equivalent). The resulting impact
+is complete authentication and authorization bypass (C:H/I:H). Attack Complexity is High (AC:H) because the attacker must obtain the RSA public key and the verifier must use a mixed-algorithm configuration; no authentication is required (PR:N). This is a patch bypass: users who upgraded to 2.13.0 specifically to remediate CVE-2026-48526 remain vulnerable.
+
+Suggested Fix
+Option A (minimal): Replace lstrip() with an explicit strip of known
+BOM prefixes before the JSON detection check:
+
+# Strip common BOM prefixes in addition to ASCII whitespace
+BOM_PREFIXES = (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")
+stripped = key_bytes
+for bom in BOM_PREFIXES:
+ if stripped.startswith(bom):
+ stripped = stripped[len(bom):]
+ break
+stripped = stripped.lstrip()
+Option B (more robust): Use json.loads() as the detection mechanism
+instead of a byte-prefix check, so encoding variants and whitespace are
+handled by the JSON parser:
+
+try:
+ test_obj = json.loads(key_bytes.strip())
+ if isinstance(test_obj, dict) and "kty" in test_obj:
+ raise InvalidKeyError("The specified key is an asymmetric key...")
+except (ValueError, UnicodeDecodeError):
+ pass
+Option B is preferred because it is resilient to any future encoding variant.
+
+Maintainer update — 2026-09-09
+We reproduced the reported algorithm-confusion path on PyJWT 2.13.0. When an application passes a raw public RSA JWK as the key and allows both an asymmetric and HMAC algorithm, a forged HS256 token signed with the known public JWK bytes is accepted when the JWK is represented in encodings accepted by Python's JSON decoder. The normal raw-JWK, asymmetric-only, and algorithm-bound PyJWK controls reject the token. This is an application configuration precondition, but the bypass is in PyJWT's own raw-JWK validation guard and is in scope under the PyJWT security policy.
+
+The fix is committed as 180783930de91876bc0d601f826a1f2956057291. HMACAlgorithm.prepare_key() now checks parsed JSON objects for kty across accepted UTF-8/16/32 representations, preserves non-JWK HMAC key bytes, and conservatively rejects deeply nested JSON objects even when parsing reaches the recursion guard. Regression coverage includes BOM and BOM-less encodings, deep non-JWK keys, deep JWK objects, and unpaired-surrogate cases.
+
+The full suite passes with 391 tests and 4 intentional cryptography-environment skips. A fresh Astra/max independent review accepted commit 180783930de91876bc0d601f826a1f2956057291. It independently confirmed encoding/BOM handling, recursion and surrogate behavior, preservation of non-object key compatibility, and the reported test results.
+
+The fix has not been released. The advisory remains High with its existing CVSS 3.1 score of 7.4, and the patched version remains unset pending release planning.
+
+Classification update — 2026-09-10
+We completed the advisory classification review. The proposed CVSS 3.1 vector is CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N and the proposed CWE classification is CWE-347. These classifications reflect the documented impact and do not alter the affected range, fix status, or lifecycle state.
+
+Maintainer update — 2026-09-11
+The verified fix for this advisory is included in PyJWT 2.14.0, released on 2026-09-11 and available on PyPI. PyJWT 2.14.0 is the first release containing the fix. This advisory is now published with 2.14.0 recorded as the patched version.

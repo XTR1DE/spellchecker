@@ -1,0 +1,48 @@
+Impact
+serialize-javascript escapes its output so it is safe to embed inside a
+<script> element. In 7.1.1 that guarantee does not hold for function
+values: a crafted function body can carry a literal, unescaped </script>
+into the output, terminating the script element early so the remainder is
+parsed as HTML.
+
+SCRIPT_CLOSE_REGEXP used <\/script[^>]*> as its first alternative. The
+character class excludes only >, so a single match could run from one
+</script all the way to the next > anywhere in the source — swallowing a
+second, complete </script> along the way. Only one replacement is emitted
+per match, and the plain-code branch neutralizes just the leading <
+('< ' + match.slice(1)), so the swallowed tag was re-emitted verbatim.
+
+Reaching that shape requires </script in code position, which is legal
+JavaScript: x</script=+/ parses as x < /script=+/, a comparison against a
+regex literal.
+
+const serialize = require('serialize-javascript');
+const src = "function f(x){ return x</script=+/ + '</script><img src=x onerror=alert(1)>' }";
+const out = serialize({ h: new Function('return ' + src)() });
+// {"h":function f(x){ return x< /script=+/ + '</script><img src=x onerror=alert(1)>' }}
+Embedded as the README documents (<script>window.S = <%= serialize(state) %></script>)
+and parsed by Chromium, the script element ends at the injected tag and the
+<img> becomes a live DOM node with its onerror handler executing in the
+page origin.
+
+Only the function path is affected. The same payload passed as data is
+escaped correctly, and options.isJSON / non-function values are unaffected.
+
+Patches
+Fixed in 7.1.2. The wildcard now excludes < as well as >
+([^<>]*), so a match can never reach past a second <. Every </script
+in the source therefore either begins its own match or is followed by a
+character the HTML tokenizer does not accept as ending a tag name — it ends
+the tag name only on TAB, LF, FF, CR, SPACE, / or >, and emits anything
+else as text.
+
+Workarounds
+Upgrade to 7.1.2. If you cannot upgrade, 7.1.0 and earlier are
+unaffected, or avoid serializing functions whose source text is
+attacker-influenced.
+
+Regression note
+This is a regression specific to 7.1.1, not a long-standing issue. 7.1.0 and
+earlier applied the same wildcard but escaped the entire match, so no tag
+survived. Downstream scanners defaulting to a >= 7.1.0 range would be
+overly broad.

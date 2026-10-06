@@ -1,0 +1,11 @@
+Impact
+Undici's interceptors.retry() can resume a request after a partial response and append the resumed bytes to an already partially delivered body, while the application still receives the original response's status and headers. When that response carried a Content-Length, the application can receive a longer body. Applications that forward Undici's status, headers, and body downstream without recalculating framing, for example proxy or gateway applications, may emit a response whose body exceeds the forwarded Content-Length, and the excess bytes can be read as the start of a subsequent HTTP response (downstream response splitting or desynchronization).
+
+For example, a 404 Not Found with Content-Length: 2 that sends one byte then closes can be resumed with an open-ended Range request, and the resumed 206 Partial Content bytes are appended, so the application receives more than two body bytes while still seeing Content-Length: 2. The bug requires interceptors.retry() enabled, an attacker-controlled or faulty upstream, and a downstream forwarder that does not recalculate Content-Length.
+
+Patches
+Patched in undici v6.28.1, v7.29.1, and v8.10.2. Upgrade to one of these or later.
+
+Workarounds
+Disable interceptors.retry() for untrusted upstreams, or set maxRetries: 0.
+Remove or recalculate Content-Length before forwarding a response body assembled by Undici.

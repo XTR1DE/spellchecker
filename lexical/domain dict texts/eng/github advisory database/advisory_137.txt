@@ -1,0 +1,14 @@
+Impact
+The cache Electron keeps for sandboxed preload scripts did not verify that a cached entry matched the preload it was served for. A compromised renderer could use this to run its own code in the preload context on a later load.
+
+Apps are only affected if they load untrusted content. Apps that do not load untrusted content are not affected.
+
+Workarounds
+There are no app side workarounds, you must update to a patched version of Electron.
+
+Fixed Versions
+44.0.0-beta.6
+43.5.0 
+42.10.0
+For more information
+If you have any questions or comments about this advisory, email us at security@electronjs.org

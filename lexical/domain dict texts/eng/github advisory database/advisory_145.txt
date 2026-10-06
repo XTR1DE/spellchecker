@@ -1,0 +1,8 @@
+Impact
+webpack-dev-middleware resolves a request to a local file in getFilenameFromUrl. When the configured publicPath has no trailing slash (for example /assets), a request that shares that prefix without being under it (for example /assets../secret) still passes the containment check, and the .. guard does not catch it because it runs on the path before the publicPath prefix is stripped. The stripped remainder then escapes the configured output directory once joined, so an unauthenticated request can read files outside the output root. Applications serving webpack-dev-middleware (directly or via webpack-dev-server) with a publicPath that does not end in a slash are affected. A development server reachable on the network can be attacked with a single request and no victim interaction.
+
+Patches
+Patched in webpack-dev-middleware 8.3.0. There is no backport to the 5.x, 6.x, or 7.x lines; users on those lines should upgrade to 8.3.0 or later.
+
+Workarounds
+Configure publicPath with a trailing slash (for example /assets/ instead of /assets), or upgrade to a patched version.

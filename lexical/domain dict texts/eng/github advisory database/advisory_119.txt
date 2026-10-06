@@ -1,0 +1,76 @@
+Summary
+A malformed RSA JWK inside a JWK Set aborts parsing of the entire set instead of being skipped, because RSAAlgorithm.from_jwk can raise a plain ValueError that isn't caught by PyJWKSet's per-key error-skipping logic.
+
+Affected component / version
+Package: PyJWT (PyPI, ecosystem pip)
+Files: jwt/api_jwk.py (PyJWK.__init__, PyJWKSet.__init__), jwt/algorithms.py (RSAAlgorithm.from_jwk)
+Confirmed present in the master branch as of 2026-09-05 (commit 7144e4534c34810f4525dc4578a32addd8212cff, tag 2.13.0). Directly verified identical in tags 2.9.0, 2.10.0, 2.11.0, 2.12.0, 2.12.1, 2.13.0 -- the vulnerable call and the except PyJWTError guard are unchanged across all six releases. Not verified against any release prior to 2.9.0.
+Details
+PyJWKSet.__init__ (jwt/api_jwk.py:145-152) iterates each key in a JWK Set:
+
+for key in keys:
+    try:
+        self.keys.append(PyJWK(key))
+    except PyJWTError as error:
+        if isinstance(error, MissingCryptographyError):
+            raise error
+        # skip unusable keys
+        continue
+PyJWK.__init__ (api_jwk.py:82) calls self.Algorithm.from_jwk(self._jwk_data) with no try/except of its own. For an RSA JWK, this dispatches to RSAAlgorithm.from_jwk (jwt/algorithms.py:539-586). When the JWK supplies d, e, n without the CRT parameters (p, q, dp, dq, qi), from_jwk calls cryptography's rsa_recover_prime_factors(public_numbers.n, d, public_numbers.e) (algorithms.py:572-574) to derive the key. If d is not the correct private exponent for that n/e pair, rsa_recover_prime_factors raises a plain ValueError.
+
+ValueError is a built-in Python exception and is not a subclass of jwt.exceptions.PyJWTError (PyJWTError(Exception) is the root of PyJWT's own exception hierarchy). It is therefore not caught by PyJWKSet.__init__'s except PyJWTError, and propagates out of the constructor, aborting the for key in keys: loop before any subsequent key in the list is processed.
+
+PyJWKSet.from_dict/from_json and PyJWK.from_dict/from_json are exported public API (jwt/__init__.py). PyJWKClient.get_jwk_set (jwt/jwks_client.py:158) feeds a fetched JWKS HTTP response directly into PyJWKSet.from_dict with no per-key pre-validation, so this is reachable through the documented PyJWKClient flow whenever the fetched JWKS contains a malformed key alongside valid ones.
+
+Proof of concept
+import jwt
+
+good_jwk = {
+    "kty": "RSA",
+    "n": "<a valid base64url-encoded RSA modulus, e.g. from a real 2048-bit public key>",
+    "e": "AQAB",
+}
+
+bad_jwk = {
+    "kty": "RSA",
+    "n": good_jwk["n"],
+    "e": "AQAB",
+    "d": "AAAAAA",  # not the true private exponent for n/e, no CRT params present
+}
+
+jwks_doc = {"keys": [bad_jwk, good_jwk]}
+
+jwt.PyJWKSet.from_dict(jwks_doc)
+# raises: ValueError: Unable to compute factors p and q from exponent d.
+# (uncaught -- PyJWKSet.__init__ never returns, `good_jwk` is never added)
+Impact
+PyJWKSet.__init__ raises before completing, so no key in the JWK Set is added to the resulting set, including keys unrelated to the malformed entry. This requires the malformed key to already be present in a JWK Set the application parses (e.g. one entry in an aggregated/federated key set, or a key affected by transit corruption before signature verification of the JWKS transport itself). Applications that vet each key individually before adding it to a trusted set are not affected. The failure is an uncaught ValueError, not one of PyJWT's documented jwt.exceptions.* types, so exception handling written against PyJWT's documented contract (except jwt.exceptions.PyJWTError) will not catch it either.
+
+Suggested remediation
+Wrap the key-construction call in PyJWK.__init__ (api_jwk.py:82) so a ValueError is converted into InvalidKeyError (a PyJWTError subclass):
+
+try:
+    self.key = self.Algorithm.from_jwk(self._jwk_data)
+except ValueError as e:
+    raise InvalidKeyError(f"Unable to construct key from JWK: {e}") from e
+This lets PyJWKSet.__init__'s existing except PyJWTError: continue skip the one malformed key as its own comment already states is intended.
+
+Responsible Disclosure Timeline
+Per the OWASP Vulnerability Disclosure Cheat Sheet and Google Project Zero's 2020 disclosure policy:
+
+Day 0 (date of submission): to be set to the actual API response's created_at timestamp when this report is submitted. If submitted on the date of this draft (2026-09-05), Day 0 = 2026-09-05.
+Day 90 (full-public-disclosure deadline, regardless of fix status): Day 0 + 90 days -- 2026-12-04 if Day 0 is 2026-09-05.
+A brief mutually-agreed extension (standard 14-day grace period) is available if a fix is scheduled but not yet shipped by Day 90 -- extending to 2026-12-18 in that case.
+This window may shorten instead of extend if the issue is confirmed under active exploitation.
+Try It Yourself (Sandbox)
+Reproduce the PoC above, and attempt your own fix, in an isolated sandbox with no access to production systems, secrets, or real data.
+
+Sandbox: jwt.py
+Course: Tenant Zero: AI & SaaS Authz Failures
+Credit
+Discovered and reported by SecDim Security Research: secdim.com, @secdim, security@secdim.com.
+
+Maintainer update — 2026-09-08
+We reproduced the reported behavior on PyJWT 2.13.0 with cryptography installed: a malformed RSA private JWK containing an invalid d value and no CRT parameters raised a plain ValueError while parsing a JWK set. Because PyJWKSet skips PyJWTError instances only, that exception aborted parsing before subsequent valid keys were loaded. The impact is a conditional availability failure for applications that parse a key set containing a malformed entry; it is not a signature-forgery or claims-verification bypass.
+
+The independently verified affected range is >= 2.9.0, <= 2.13.0; earlier releases were not checked. A narrow fix has been prepared in commit 8915570 based on master commit 5fa7594: PyJWK converts key-construction ValueError exceptions to InvalidKeyError, allowing the existing PyJWKSet skip path to continue. Regression coverage verifies that a malformed RSA key is skipped while a valid key in the same set remains usable. The full suite passes with 370 tests and 4 intentional cryptography-environment skips; formatting, lint, and targeted type checks pass. The advisory remains in triage while the fix goes through release planning.

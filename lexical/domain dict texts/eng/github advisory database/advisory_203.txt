@@ -1,0 +1,17 @@
+Summary
+langchain-nvidia-ai-endpoints versions before 1.4.2 accepted local filesystem paths as image inputs for Vision Language Model (VLM) requests. If an application passed attacker-controlled image input to ChatNVIDIA or VLM reranking APIs, an attacker could cause files readable by the application process to be read and included in the outbound request to the configured NVIDIA/NIM model endpoint.
+
+Impact
+Applications are affected if they use VLM image inputs with ChatNVIDIA or NVIDIARerank and allow untrusted users to control image URLs or document image metadata.
+
+An attacker who can control those inputs may be able to read local files accessible to the application process. Applications that do not use VLM image inputs, or that only pass trusted image references, are not affected.
+
+Patched Version
+Upgrade to langchain-nvidia-ai-endpoints >= 1.4.2.
+
+The patched version rejects raw local filesystem paths for VLM image inputs. Supported inputs are remote URLs, data:image/...;base64,... URIs, and supported asset/file IDs.
+
+Workarounds
+If upgrading is not immediately possible, applications should reject local filesystem paths in user-controlled VLM image inputs and only allow trusted remote URLs, data URIs, or known safe asset/file IDs.
+
+Applications should also run with least-privilege filesystem access so that the application process cannot read files it does not need.

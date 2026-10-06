@@ -1,0 +1,15 @@
+Impact
+Windows opened from a sandboxed top-level document did not inherit that document's HTML sandbox restrictions, so content that was meant to run sandboxed could open a window with the app's full origin. GHSA-hq2x-r82h-9wj4 covers the same issue for sandboxed iframes.
+
+Apps are only affected if they render untrusted content in a sandboxed top-level document that allows popups. Apps that deny popups from untrusted content with setWindowOpenHandler are not affected.
+
+Workarounds
+Return { action: 'deny' } from setWindowOpenHandler for windows opened by untrusted content.
+
+Fixed Versions
+44.0.0-beta.5
+43.4.1
+42.9.2
+41.10.6
+For more information
+If you have any questions or comments about this advisory, email us at security@electronjs.org

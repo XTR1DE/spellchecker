@@ -1,0 +1,49 @@
+/api/storage/getOutlineStorage is registered with CheckAuth only and performs no authorization of any kind. Given a document identifier it returns that document's stored outline state, regardless of the document's publish tier.
+
+The two write endpoints for the same data, setOutlineStorage and removeOutlineStorage, both carry CheckAdminRole and CheckReadonly. Only the read path is unguarded.
+
+Details
+Routes. kernel/api/router.go:103 on master, :108 on the development branch:
+
+ginServer.Handle("POST", "/api/storage/getOutlineStorage",    model.CheckAuth, getOutlineStorage)
+ginServer.Handle("POST", "/api/storage/setOutlineStorage",    model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, setOutlineStorage)
+ginServer.Handle("POST", "/api/storage/removeOutlineStorage", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, removeOutlineStorage)
+Handler. kernel/api/storage.go:466 on the development branch, :469 on master, identical. It binds docID and calls model.GetOutlineStorage(docID), which iterates the stored outline documents and returns the entry whose DocID matches. There is no filter function on this path at all: no *gin.Context, no publish-access check, no password check, no visibility check. The caller supplies the identifier and receives the payload.
+
+What is stored. type OutlineDoc { DocID string; Data map[string]any }. The client writes it from app/src/layout/dock/Outline.ts:742:
+
+fetchPost("/api/storage/setOutlineStorage", {
+    docID: this.blockId,
+    val: { expandIds: this.tree.getExpandIds() }
+});
+So the payload is the set of heading block identifiers the administrator has expanded in the outline pane for that document. Secondarily, an empty result versus a populated one indicates whether the administrator has ever worked with that document's outline.
+
+Not covered by the local-storage fix. Commit 4daee87d4 addressed getLocalStorage, getLocalStorageVal, getLocalStorageVals and FilterLocalStorageByPublishAccess. The word "outline" does not appear in that diff. That filter was under-inclusive; this endpoint has no filter to be under-inclusive.
+
+Proof of Concept
+Kernel 3.7.2, publish mode on port 6808, Publish.Auth.Enable false, anonymous client with no auth header.
+
+An administrator wrote outline state through the authenticated port:
+
+POST /api/storage/setOutlineStorage
+{"docID":"<doc id>","val":{"openIDs":["<heading id>","<heading id>"]}}
+→ {"code":0,"msg":"","data":null}
+The same value read back anonymously:
+
+POST http://127.0.0.1:6808/api/storage/getOutlineStorage
+{"docID":"<doc id>"}
+→ {"code":0,"msg":"","data":{"openIDs":["<heading id>","<heading id>"]}}
+With that document set to the forbidden tier, on the same anonymous session:
+
+Endpoint	Result
+getDoc (control)	protyle-password--forbidden placeholder, content withheld
+getOutlineStorage	full payload returned
+The control establishes that the session is correctly denied the document itself.
+
+Impact
+An anonymous reader in publish mode, or any publish RoleReader, retrieves the administrator's outline state for any document whose identifier they hold, including documents in the forbidden tier that the publish filters otherwise withhold entirely. The disclosed values are heading block identifiers, usable as input to other endpoints, and the presence or absence of an entry indicates whether the administrator has worked with that document.
+
+No document text is returned. Confidentiality only.
+
+Suggested fix
+Gate the read path as the write paths already are. Either add CheckAdminRole and CheckReadonly at the route, matching setOutlineStorage and removeOutlineStorage, or pass *gin.Context into GetOutlineStorage and apply checkBlockTreeAccessableByPublishAccess against the requested docID before returning anything.

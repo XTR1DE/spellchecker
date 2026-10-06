@@ -1,0 +1,11 @@
+Здесь все записи с GitHub Advisory Database начиная с
+
+Oct 01, 2026 21:29 GMT+5
+пост (SiYuan: The reference filter for getRefIDs checks visibility but not the password tier, disclosing that password-protected documents reference a given block Moderate
+CVE-2026-73606 was published for github.com/siyuan-note/siyuan/kernel (Go) yesterday)
+
+и по
+
+Sep 24, 2026, 21:38 GMT+5
+пост (Snipe-IT: 2FA bypass via the API token flow High
+CVE-2026-63493 was published for snipe/snipe-it (Composer) last week)

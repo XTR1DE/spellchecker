@@ -1,0 +1,6 @@
+Description
+download_wheel() runs pip download and hands the result straight to the seeder, with nothing checking the bytes it gets back. The embedded pip and setuptools wheels carry a BUNDLE_SHA256 that virtualenv checks on every load, but a wheel fetched over the network for the periodic-update feature or the --download flag had no equivalent verification.
+
+A compromised index, a stale mirror, or a MITM'd download (when TLS is intercepted, e.g. via a misconfigured or malicious CA) could substitute a different wheel under the same distribution/version/filename, and virtualenv would cache and seed it into every environment created afterward with no warning.
+
+Fixed by computing the downloaded wheel's sha256 and comparing it against the digest PyPI's public JSON API reports for that exact release, independent of which index actually served the file. The check is skipped, not treated as failure, when a custom index (PIP_INDEX_URL, PIP_EXTRA_INDEX_URL, PIP_INDEX) is configured, since a private index can legitimately serve a different, intentionally rebuilt wheel. Fix: pypa/virtualenv#3251

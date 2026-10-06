@@ -1,0 +1,22 @@
+Impact
+The vk-app backend accepted VK application callback data without verifying the callback signature when the auth_key parameter was omitted.
+
+Applications using this backend could treat unsigned attacker-controlled data as a verified VK identity. An attacker could choose callback fields such as viewer_id, access_token, api_id, and api_result, potentially allowing authentication as an arbitrary VK user ID.
+
+The issue affects only applications using the vk-app backend.
+
+Patches
+The issue has been fixed by requiring auth_key to be present and valid before callback data is trusted.
+
+Users should upgrade to a patched version.
+
+Fix:
+
+python-social-auth/social-core#1811
+Workarounds
+Applications that cannot upgrade immediately should disable the vk-app backend by removing social_core.backends.vk.VKAppOAuth2 from SOCIAL_AUTH_AUTHENTICATION_BACKENDS.
+
+There is no complete workaround while continuing to use the vulnerable backend.
+
+Credits
+Reported by @lalalala5678 through GitHub private vulnerability reporting.

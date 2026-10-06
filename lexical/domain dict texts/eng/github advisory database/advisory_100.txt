@@ -1,0 +1,38 @@
+Impact
+A denial-of-service vulnerability exists in Engine.IO / Socket.IO servers that allow transport upgrades.
+
+The Engine.IO protocol revision is negotiated during the initial handshake and stored on the session, but a newly-created transport, including a WebSocket upgrade transport, could independently derive a different protocol revision from the upgrade request query parameters. The server did not verify that the protocol revision of an upgrade request matched the protocol revision of the existing session.
+
+A malicious client could exploit this mismatch by establishing a valid Engine.IO session and then sending an upgrade request with a different, or omitted, EIO query parameter. This could cause the server to attach a transport using a parser and heartbeat behavior inconsistent with the session. Under some conditions, a crafted heartbeat packet could trigger an uncaught exception and terminate the Node.js process.
+
+Servers using the default Engine.IO v4 protocol are impacted. The issue can be triggered even when Engine.IO v3 compatibility is disabled, because an omitted EIO parameter is interpreted as protocol v3 on the affected transport path.
+
+The impact is denial of service through process crash.
+
+Affected versions:
+
+engine.io >= 6.6.0, < 6.6.10
+Patches
+The issue was fixed in:
+
+engine.io 6.6.10
+Users should upgrade to engine.io@6.6.10 or later.
+
+If using Socket.IO packages that depend on Engine.IO, users should update to a Socket.IO release that includes the patched Engine.IO version.
+
+Workarounds
+If upgrading is not immediately possible, users can reduce exposure by disabling transport upgrades:
+
+const io = new Server(httpServer, {
+  allowUpgrades: false
+});
+or by allowing only a single transport, for example WebSocket only:
+
+const io = new Server(httpServer, {
+  transports: ["websocket"]
+});
+These mitigations avoid the vulnerable upgrade path, but they may affect client compatibility and connection behavior.
+
+As an additional temporary mitigation, deployments may reject Engine.IO requests for an existing sid when the EIO query parameter is missing or does not match the protocol revision used during the initial handshake. This is best done at the application proxy or middleware layer only if the deployment can reliably track the session’s negotiated protocol.
+
+Upgrading remains the recommended fix.

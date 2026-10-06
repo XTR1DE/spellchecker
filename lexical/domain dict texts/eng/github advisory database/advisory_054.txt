@@ -1,0 +1,89 @@
+Summary
+Repo.__init__ decides which directory is the git directory by testing candidate paths in an order that
+considers the real .git last. Two earlier tests can be satisfied by ordinary tracked files. Git
+reserves only the literal name .git, so HEAD, objects/, refs/, config, gitdir, commondir
+and hooks/ at a repository root are all legal tracked content.
+
+Consequently, after a victim opens or clones an attacker's repository, GitPython resolves git_dir to
+the working-tree root while real git correctly resolves <root>/.git. Everything GitPython then
+treats as "inside the git directory" is attacker-authored content — including hooks/, which it
+executes.
+
+CVE-2026-87817
+Affected code (3.1.59)
+The discovery loop in git/repo/base.py tests, in order:
+
+git/repo/base.py:299 — isfile(curpath/gitdir) and isfile(curpath/commondir) and isfile(curpath/HEAD)
+git/repo/base.py:320 — is_git_dir(curpath)
+git/repo/base.py:341 — dotgit = osp.join(curpath, ".git") ← the real git dir, considered last
+is_git_dir (git/repo/fun.py:60) requires only that objects/ and refs/ are directories and that
+HEAD is a file; HEAD's contents are never parsed. The hook path is resolved from
+index.repo.git_dir (git/index/fun.py:73), i.e. the mis-resolved directory.
+
+Proof of concept
+Requires only pip install GitPython==3.1.59. Full script attached as poc1_rce.py; it runs entirely
+in a temp directory and the payload only writes a marker file.
+
+Attacker repository — four ordinary tracked files at the root:
+
+path	mode	content
+gitdir	100644	.git\n
+commondir	100644	.git\n
+HEAD	100644	ref: refs/heads/master\n
+hooks/pre-commit	100755	#!/bin/sh + payload
+Victim — two ordinary calls:
+
+repo = git.Repo.clone_from(url, dst)     # or git.Repo(dst)
+repo.index.commit("automated commit")    # code execution happens here
+Observed on the PyPI release 3.1.59 (Linux and Windows):
+
+real git says the git dir is : /tmp/.../victim/.git
+GitPython says it is         : /tmp/.../victim      <- shadowed
+attacker's hook executed     : True
+git fsck                     : (clean)
+The pre-commit hook runs at git/index/base.py:1201, before write_tree(), so it fires even though
+the commit later fails.
+
+Impact
+A service that opens or clones an untrusted repository with GitPython — a CI runner building a fork
+pull request, a code-scanning/SBOM service, a mirror, a dependency bot, an AI code-review/agent tool —
+can be made to:
+
+Execute arbitrary commands via the tracked <root>/hooks/pre-commit when the victim calls
+index.commit().
+Read files outside the repository: the tracked <root>/config becomes the repository config and
+is parsed with merge_includes=True (git/repo/base.py:765), so [include] path = ~/.aws/credentials
+discloses the file. (Repo._config_reader still defaults merge_includes=True, so the hardening
+added in 3.1.59 for .gitmodules/GHSA-7833 does not cover this path.)
+Write a config file to an attacker-chosen directory via an absolute tracked commondir.
+Delivery is silent: git clone exits 0, git fsck (including --strict, and with
+transfer.fsckObjects/fetch.fsckObjects=true) reports nothing, and the clone passes every read-only
+probe (head.commit, branches, is_dirty(), untracked_files, iter_commits) because a tracked
+commondir of .git pins common_dir to the real .git.
+
+Threat model / preconditions
+Attacker controls the content of a repository the victim opens or clones with GitPython (public repo,
+fork PR, mirrored dependency).
+For code execution, the victim performs a commit via GitPython's native index.commit(). For the
+file-read impact, opening the repo and reading config is enough.
+GIT_WORK_TREE is not a mitigation — git_dir is assigned and the discovery loop breaks before
+the environment is consulted.
+Real git is unaffected; only GitPython mis-resolves the directory.
+Remediation
+Test curpath/.git before the gitdir/commondir/HEAD triple and before is_git_dir(curpath).
+Resolve hook_path / _commit_hook_path / _get_validated_reflog_path through repo.common_dir.
+Containment-check commondir/gitdir contents before joining (reuse
+SymbolicReference._get_validated_path).
+Validate HEAD in is_git_dir (require ref: refs/... or a 40-hex sha).
+Pass merge_includes=False in Repo._config_reader (git/repo/base.py:765).
+Note for the maintainers
+Commit 406b98e1 (2026-05-31, "respect core.hooksPath for commit hooks") resolved the hook path via
+git rev-parse --git-path, which is immune because git rediscovers the true .git. Commit 9bc287a2
+(2026-07-20) reverted it to avoid an unconditional rev-parse dependency — reintroducing the exec step.
+Measured at each commit with the healthy-looking layout: 406b98e1 → hook did not fire; 9bc287a2 …
+3.1.59 → hook fired.
+
+Scope note
+Only the repository-root case is reported: where a real .git exists, git prefers it, and GitPython
+does not. A fake git dir in a subdirectory fools real git too, so that variant is out of scope as a
+general ecosystem hazard rather than a GitPython defect.

@@ -1,0 +1,46 @@
+Summary
+Axios exposes maxRedirects to limit redirect following, and maxRedirects: 0 is used by applications as a redirect-based SSRF guard. The Node HTTP adapter enforces this option. The fetch adapter does not read it and does not set a Fetch API redirect mode, so the runtime default of redirect: 'follow' applies.
+
+Applications are affected when they rely on maxRedirects: 0 and use the fetch adapter, either explicitly or because the runtime selects it.
+
+Impact
+An attacker who controls the initial URL or a redirecting server can cause a fetch-adapter request to follow a redirect even though the caller configured maxRedirects: 0. If the redirect target is reachable only from the application environment, this can expose internal responses or trigger state-changing internal endpoints.
+
+This should not be described as unconditional SSRF. The bypass requires a redirect source, such as an attacker-controlled server or open redirect, and an application that trusted maxRedirects: 0 as the redirect guard.
+
+Affected Functionality
+Affected:
+
+adapter: 'fetch'.
+Runtime environments where fetch is selected by adapter resolution.
+Requests configured with maxRedirects: 0 but without fetchOptions.redirect: 'manual' or equivalent runtime-specific redirect control.
+Not affected:
+
+Node HTTP adapter, which enforces maxRedirects: 0.
+Requests that do not follow redirects in the underlying fetch implementation because the caller explicitly configured fetch redirect behavior.
+Technical Details
+lib/adapters/fetch.js destructures many fields from resolveConfig(config), but not maxRedirects. It then builds fetch options without a redirect key:
+
+const resolvedOptions = {
+  ...fetchOptions,
+  signal: composedSignal,
+  method: method.toUpperCase(),
+  headers: toByteStringHeaderObject(headers.normalize()),
+  body: data,
+  duplex: 'half',
+  credentials: isCredentialsSupported ? withCredentials : undefined,
+};
+Because redirect is absent, the Fetch API default is to follow redirects.
+
+Local verification on axios 1.18.1 showed the HTTP adapter throwing with maxRedirects: 0, while the fetch adapter followed the same loopback 302 and returned the internal response.
+
+Proof of Concept of Attack
+Constrained local demonstration:
+
+Start server A that returns 302 Location: http://127.0.0.1:<server-b>/internal.
+Start server B that returns INTERNAL.
+Compare:
+await axios.get(serverA, { adapter: 'http', maxRedirects: 0 });  // throws
+await axios.get(serverA, { adapter: 'fetch', maxRedirects: 0 }); // returns INTERNAL
+Workarounds
+For fetch-adapter requests, set fetchOptions: { redirect: 'manual' } where the runtime supports it, or use the Node HTTP adapter for requests that rely on axios redirect limits.

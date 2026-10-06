@@ -1,0 +1,42 @@
+Summary
+Axios default-instance requests that omit an explicit method can read an inherited method value from Object.prototype. If another vulnerability in the same process pollutes Object.prototype.method, calls such as axios.request({ url }) and axios({ url }) can send a state-changing HTTP method instead of the expected default GET.
+
+Axios does not create the prototype pollution source. This is a read-side gadget in axios request dispatch.
+
+Impact
+In an affected application with a separate prototype-pollution primitive, an attacker can change axios default-instance requests that omit method from GET to methods such as DELETE, POST, PUT, or PATCH. The practical impact depends on the target endpoint and can include unintended writes, deletion, or other state changes.
+
+Method aliases such as axios.get(url) and requests with an explicit own method are not affected by the confirmed method path.
+
+Affected Functionality
+Affected:
+
+Default axios instance calls: axios.request({ url }).
+Callable shorthand: axios({ url }).
+Requests where no own config.method is provided.
+Not affected in the confirmed method PoC:
+
+axios.get(url) and other method aliases.
+axios.request({ url, method: 'GET' }).
+axios.create().request({ url }) when the created instance defaults are produced by current mergeConfig() and do not inherit from Object.prototype.
+Technical Details
+lib/core/Axios.js sets the request method with:
+
+config.method = (config.method || this.defaults.method || 'get').toLowerCase();
+mergeConfig() now returns a null-prototype request config, so config.method is safe from Object.prototype. However, the default axios instance stores the module defaults object as this.defaults, and that defaults object is a normal object. If Object.prototype.method exists, this.defaults.method resolves to the polluted inherited value.
+
+Local verification on axios 1.18.1 showed a default-instance axios.request({ url }) request reaching a loopback server as DELETE after Object.prototype.method = 'DELETE'.
+
+Proof of Concept of Attack
+Constrained local demonstration:
+
+Object.prototype.method = 'DELETE';
+try {
+  await axios.request({ url: 'http://127.0.0.1:<port>/resource' });
+} finally {
+  delete Object.prototype.method;
+}
+Expected safe behavior is a GET request. Current affected behavior sends DELETE on the default instance when no method is provided.
+
+Workarounds
+Use explicit method aliases such as axios.get() or set an own method on request configs. Avoid default-instance shorthand for requests in processes where prototype pollution is suspected or possible.

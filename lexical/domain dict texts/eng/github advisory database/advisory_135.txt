@@ -1,0 +1,15 @@
+Impact
+Responses served through protocol.registerFileProtocol or protocol.registerHttpProtocol for a custom scheme registered with supportFetchAPI: true but without corsEnabled: true could be read cross-origin by web content. This completes the fix for CVE-2026-70604.
+
+Apps are only affected if they register such a scheme, serve it through one of those handlers, and load untrusted content. Apps that set corsEnabled: true, or that do not load untrusted content, are not affected.
+
+Workarounds
+Set corsEnabled: true on the scheme, or do not load untrusted content in windows that can reach it.
+
+Fixed Versions
+44.0.0-beta.5
+43.4.1
+42.9.2
+41.10.6
+For more information
+If you have any questions or comments about this advisory, email us at security@electronjs.org

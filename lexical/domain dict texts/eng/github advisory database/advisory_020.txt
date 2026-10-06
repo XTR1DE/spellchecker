@@ -1,0 +1,2 @@
+Description
+uneval performs synchronous work proportional to a sparse array's declared length. An application that passes attacker-influenced sparse values to uneval can suffer event-loop blocking. Since attacker-controlled creation of sparse arrays is so difficult, this vulnerability is very difficult to exploit.

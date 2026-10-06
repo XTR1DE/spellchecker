@@ -1,0 +1,225 @@
+Closed issue #1429 ("Handle non-UTF-8 paths", 2024-03-24) discussed this concern. The shipped check in WhitespacePathNormalizer uses:
+
+public function normalizePath(string $path): string
+{
+    $unixPath = str_replace('\\', '/', $path);
+    if (preg_match('#\p{C}+#u', $unixPath)) {
+        throw CorruptedPathDetected::forPath($path);
+    }
+}
+
+preg_match() may return false for invalid UTF-8 instead of 0; both are falsy, so the check may fail to throw.
+
+C# + Markdown
+public class T {
+    public string? EnglishName { get; set; }
+    public int Id { get; set; }
+}
+
+List1 = [
+    { "A", ? }, { "B", ? }, { "A", ? }
+];
+List2 = [
+    { "A", 1 }, { "B", 2 }
+];
+
+// List1: duplicates allowed.
+// List2: source of truth.
+
+| EnglishName | Id |
+|:-----------:|---:|
+| A           | ?  |
+| B           | ?  |
+HTML + CSS + JS + PHP
+<style>
+.card { display: inline-block; border: 1px solid black; }
+</style>
+
+<div class="card">
+  <img src="noFilter.jpg" width="50%">
+  <button class="artButton" id="42">join</button>
+</div>
+
+<script>
+$(".artButton").click(function () {
+    const id = $(this).attr("id");
+    $.ajax({
+        type: "POST",
+        url: "writeToTxt.php",
+        success: r => console.log("Success")
+    });
+});
+</script>
+
+<?php
+$data = $_POST["data"];
+fwrite($handle, $data);
+?>
+Ruby + Python
+require 'csv'
+
+total = 0
+store = []
+
+CSV.foreach("example_data.csv", headers: true) do |info|
+  total += info["item price"].to_f * info["purchase count"].to_i
+  store << [info["purchaser name"], info["item description"]]
+end
+
+puts total
+puts store
+import base64, json, jwt
+
+def b64url(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=")
+
+header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+payload = b64url(b"[" * 20_000 + b"]" * 20_000)
+token = (header + b"." + payload).decode()
+
+jwt.decode(token, options={"verify_signature": False})
+PHP CLI + Electron JS + C + Bash
+<?php
+var_dump(stream_isatty(STDIN));
+echo "type: ";
+var_dump(fgets(STDIN));
+?>
+import { app, BrowserWindow } from "electron";
+
+function createWindow() {
+    const win = new BrowserWindow({ width: 800, height: 600 });
+    win.loadURL("http://localhost:3000");
+}
+#include <stdio.h>
+
+int main(void) {
+    int x = 1;
+    return 0;
+}
+curl -X POST https://example.com/api
+curl -X POST command used to send a request
+git status check the repository
+VAR=value python script.py
+./exploit.sh
+Inline code inside prose
+
+From the config file, write_test() emits the prompt before home.
+
+The decoder uses decode_complete() before validation.
+Configuration is updated through PyEnvCfg.write().
+
+The relevant API surface is repo.index.diff(...), and another helper is func.func().
+
+The application calls startswith("/var/www/static/").
+
+Python code mixed with prose
+
+Minimal vulnerable server (server.py):
+
+import tornado.web, tornado.ioloop
+
+app = tornado.web.Application([
+    (r"/static/(.*)", tornado.web.StaticFileHandler, {"path": "/tmp/static"}),
+])
+app.listen(8888)
+tornado.ioloop.IOLoop.current().start()
+
+Exploit:
+
+curl http://localhost:8888/static/config.conf
+
+Impact: any application using StaticFileHandler may be affected.
+
+Python qualified calls / assignments
+repo.index.diff(
+    None,
+    no_index=True,
+    paths=[baseline_path, target_path],
+    create_patch=True,
+)
+File references and technical identifiers
+git/repo/base.py:299
+git/repo/base.py:320
+git/repo/base.py:341
+git/repo/fun.py:60
+
+GHSA-9r54-q6cx-xmh5
+SHA-256 324997f231561bf6da39b8f9d1e272f69bfde8871a7863f5cb7b70e22e91f076
+Inline statements
+if ($uri ~* ";") {
+    return 400;
+}
+Ambiguous / negative examples
+
+This is normal prose with no code.
+
+The function is called somewhere in the implementation.
+
+Check version:2 of the protocol.
+
+Use TCP/IP for the connection.
+
+Input/output is described in the documentation.
+
+400: def _to_relative_path(cls, parent_repo, path)
+path = cls._to_relative_path(repo, path)
+
+head.c
+FILE - head.c
+The rest of this sentence is normal WORD text.
+
+### Additional code-boundary tests
+
+Python block:
+
+import tornado.web, tornado.ioloop
+
+app = tornado.web.Application(...)
+app.listen(8888)
+tornado.ioloop.IOLoop.current().start()
+
+
+JavaScript statements:
+
+const DATA_URL_PATTERN = /^([^,;]+\/[^,;]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/;
+
+await axios.get('data:' + '/'.repeat(6000));
+
+return unmapIPv4MappedIPv6(hostname.replace(/\\.+$/, ''));
+
+
+JavaScript import and environment access:
+
+import shouldBypassProxy from 'axios/lib/helpers/shouldBypassProxy.js';
+
+process.env.NO_PROXY = 'example.com';
+shouldBypassProxy('http://' + '.'.repeat(6000) + 'a/');
+
+
+JavaScript object property assignment:
+
+Object.prototype.maxDepth = 1;
+
+
+JavaScript multiline call:
+
+await axios.post(url, { a: { b: { c: 'value' } } }, {
+  headers: { 'Content-Type': 'multipart/form-data' }
+});
+
+
+Python-style long expression:
+
+payload = b64url(b"[" * 20_000 + b"]" * 20_000)
+token = (header + b"." + payload).decode();
+
+
+Negative prose:
+
+When the hostname is "." * n + "a", the $ anchor causes
+
+The function returns early if the channel is unknown.
+
+A phrase such as if (x) may appear in the explanation without being actual code.
+
+The reviewer wrote that return 400; would be expected here, but this sentence is only describing the behavior.

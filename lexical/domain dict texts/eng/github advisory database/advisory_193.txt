@@ -1,0 +1,13 @@
+Summary
+An container image that contains a environment variable with just a key and no value can trick podman into passing that variable from the host into the container. This is made worse by the fact that using an asterisk (*) will cause podman to pass all host variables into the container. So essentially a malicious image can exfiltrate all podman environment variables that are set in the session from where the container is launched.
+
+Details
+podman run allows --env VAR1 or --env VAR* which will read the variable values from the current environment and then passes them into the container. However because the same parsing logic was reused for the image config env section that means that an image variable could also gain access to that.
+
+Patch
+That image spec requires the env variables to be in the form of key=value, so to address this invalid formatted variables get rejected and the container will not run.
+
+Fixed in podman-container-tools/podman@6c431b7
+
+Workaround
+Do not run untrusted images. Before running an image consider inspecting the config with podman image inspect --format '{{.Config.Env}}' <image> and check for any variables that do not have a value assigned.

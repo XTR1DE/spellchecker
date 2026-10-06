@@ -1,0 +1,37 @@
+Impact
+PHPCSUtils versions 1.0.0-alpha1 through 1.2.2 contain an arbitrary code execution vulnerability in PHPCSUtils\AbstractSniffs\AbstractArrayDeclarationSniff::getActualArrayKey(). The vulnerable method is reached by any sniff that extends AbstractArrayDeclarationSniff and calls getActualArrayKey().
+
+Running PHPCS over untrusted PHP code through such a sniff, for example, in a CI pipeline that lints pull requests, or on a developer machine reviewing third-party code, could lead to arbitrary command execution on the scanning host.
+
+The vulnerability happens when the method determines the value of an array key using eval(). A maliciously crafted array key such as 'system'('id') would be executed when the code was scanned.
+
+Known attack vectors
+Known code paths that reach the vulnerable method include the following PHPCSExtra sniffs:
+
+Universal.Arrays.DuplicateArrayKey
+Universal.Arrays.MixedArrayKeyTypes
+Other packages that call AbstractArrayDeclarationSniff::getActualArrayKey() may also be vulnerable.
+
+Patches
+This issue has been fixed in PHPCSUtils 1.2.3. We recommend all users upgrade to 1.2.3 or later.
+
+Workaround
+Users who cannot upgrade immediately can disable the sniffs that reach the vulnerable method by adding <exclude> tags to their custom ruleset (replace the placeholder standard and sniff names with the ones used in your setup):
+
+<rule ref="Standard">
+	<exclude name="Standard.Category.SniffName"/>
+</rule>
+For example, to disable the two PHPCSExtra sniffs listed under "Known attack vectors":
+
+<rule ref="Universal">
+	<exclude name="Universal.Arrays.DuplicateArrayKey"/>
+	<exclude name="Universal.Arrays.MixedArrayKeyTypes"/>
+</rule>
+To verify that the sniffs have been disabled, run PHPCS with the -e flag, which lists all the sniffs a standard will run. The excluded sniffs should no longer appear in the output:
+
+phpcs -e --standard=/path/to/ruleset.xml
+Credits
+Many thanks to @rodrigoprimo for responsibly disclosing this vulnerability.
+
+How can I report a security bug?
+Please report security vulnerabilities privately via the "Security and quality" tab on the PHPCSUtils repository.

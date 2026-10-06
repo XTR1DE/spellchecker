@@ -1,0 +1,184 @@
+Overview
+Verified. Multiple Unrestricted Path Traversal vulnerabilities exist in the Knowns MCP docs and memory tools, allowing arbitrary file read, write, and deletion operations outside the project sandbox. The storage layer functions (Get, Create, Update, Rename, Delete) in both doc_store.go and memory_store.go concatenate user-controlled paths with filepath.Join() without any containment validation.
+
+Additionally, the docs.update action with a newPath parameter performs a file deletion via Rename(), but is classified as CapWrite in the permission registry rather than CapDelete. This allows an attacker with a read-write-no-delete preset to bypass deletion restrictions and destroy arbitrary files outside the project root.
+
+Affected paths
+File Path	Role	Vulnerability & Execution Impact
+internal/storage/doc_store.go	Vulnerable Sink (Docs)	Path Traversal in File Operations (CWE-22): Get(), Create(), Update(), Rename(), Delete() join user-controlled path with filepath.Join(ds.docsDir(), ...) without validating path containment.
+internal/storage/memory_store.go	Vulnerable Sink (Memory)	Path Traversal in Memory Operations (CWE-22): GetInLayer(), Create(), Update(), Delete() join user-controlled id with filepath.Join(dir, models.MemoryFileName(id)) without validation.
+internal/mcp/handlers/doc.go	Pass-Through Handler	Unsanitized Input Propagation: MCP handlers pass user-supplied path, folder, newPath directly to storage layer without sanitization.
+internal/mcp/handlers/memory.go	Pass-Through Handler	Unsanitized Input Propagation: MCP handlers pass user-supplied id directly to storage layer without sanitization.
+internal/permissions/registry.go	Authorization Bypass	Capability Misclassification (CWE-863): docs.update with newPath performs file deletion but is classified as CapWrite, bypassing CapDelete restrictions.
+Root Cause
+Missing Path Containment in DocStore
+In internal/storage/doc_store.go, all file operations use filepath.Join() to construct absolute paths without validating that the resolved path remains within docsDir():
+
+// Get retrieves a doc by its relative path (without .md extension).
+func (ds *DocStore) Get(path string) (*models.Doc, error) {
+    path = strings.TrimPrefix(path, "/")
+    path = strings.TrimSuffix(path, ".md")
+
+    // VULNERABLE: No containment check
+    absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
+    if _, err := os.Stat(absPath); err == nil {
+        // ...
+        return ds.parseFile(absPath, path, folder, false, "")
+    }
+    // ...
+}
+
+// Create writes a new doc to .knowns/docs/{path}.md.
+func (ds *DocStore) Create(doc *models.Doc) error {
+    if doc.Path == "" {
+        return fmt.Errorf("doc path is required")
+    }
+    // VULNERABLE: No containment check
+    absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(doc.Path)+".md")
+    if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+        return fmt.Errorf("create doc dir: %w", err)
+    }
+    return ds.writeFile(absPath, doc)
+}
+
+// Rename rewrites a doc to a new path and removes the old file.
+func (ds *DocStore) Rename(oldPath string, doc *models.Doc) error {
+    // ...
+    oldAbsPath := filepath.Join(ds.docsDir(), filepath.FromSlash(strings.TrimSuffix(oldPath, ".md"))+".md")
+    newAbsPath := filepath.Join(ds.docsDir(), filepath.FromSlash(strings.TrimSuffix(doc.Path, ".md"))+".md")
+    // ...
+    if err := ds.writeFile(newAbsPath, doc); err != nil {
+        return err
+    }
+    if oldAbsPath != newAbsPath {
+        // VULNERABLE: Deletes file at oldAbsPath (can be outside docsDir)
+        if err := os.Remove(oldAbsPath); err != nil && !os.IsNotExist(err) {
+            return err
+        }
+    }
+    return nil
+}
+
+// Delete removes a doc file.
+func (ds *DocStore) Delete(path string) error {
+    path = strings.TrimSuffix(path, ".md")
+    // VULNERABLE: No containment check
+    absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
+    return os.Remove(absPath)
+}
+Critical Flaws:
+
+filepath.Join resolves ../ sequences natively
+No post-Join prefix check (e.g., strings.HasPrefix(absPath, ds.docsDir()))
+No rejection of absolute paths or path traversal sequences
+Rename() performs file deletion via os.Remove(oldAbsPath), which can target files outside the docs directory
+Missing Path Containment in MemoryStore
+In internal/storage/memory_store.go, memory operations similarly lack path validation:
+
+// GetInLayer retrieves a memory entry by ID from a specific layer only.
+func (ms *MemoryStore) GetInLayer(id, layer string) (*models.MemoryEntry, error) {
+    // ...
+    dir, err := ms.dirForLayer(layer)
+    if err != nil {
+        return nil, err
+    }
+    // VULNERABLE: No containment check for id containing "../"
+    absPath := filepath.Join(dir, models.MemoryFileName(id))
+    if _, err := os.Stat(absPath); err != nil {
+        return nil, fmt.Errorf("memory %q not found in %s layer", id, layer)
+    }
+    return ms.parseFile(absPath, layer)
+}
+
+// Create writes a new memory entry to the appropriate layer directory.
+func (ms *MemoryStore) Create(entry *models.MemoryEntry) error {
+    // ...
+    dir, err := ms.dirForLayer(entry.Layer)
+    if err != nil {
+        return err
+    }
+    if err := os.MkdirAll(dir, 0755); err != nil {
+        return fmt.Errorf("create memory dir: %w", err)
+    }
+
+    // VULNERABLE: No containment check for entry.ID containing "../"
+    absPath := filepath.Join(dir, models.MemoryFileName(entry.ID))
+    return atomicWrite(absPath, []byte(renderMemory(entry)))
+}
+
+// Delete removes a memory entry by ID.
+func (ms *MemoryStore) Delete(id string) error {
+    // ...
+    filename := models.MemoryFileName(id)
+
+    dirs := []string{ms.projectDir(), ms.globalDir()}
+    for _, dir := range dirs {
+        // VULNERABLE: No containment check
+        absPath := filepath.Join(dir, filename)
+        if _, err := os.Stat(absPath); err == nil {
+            return os.Remove(absPath)
+        }
+    }
+
+    return fmt.Errorf("memory %q not found", id)
+}
+Authorization Bypass via Rename-as-Delete
+In internal/mcp/handlers/doc.go, the handleDocUpdate() function accepts a newPath parameter that triggers a rename operation:
+
+func handleDocUpdate(getStore func() *storage.Store, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+    // ...
+    if v, ok := stringArg(args, "newPath"); ok && strings.TrimSpace(v) != "" {
+        doc.Path = strings.Trim(strings.TrimSuffix(v, ".md"), "/")
+    }
+    // ...
+    if oldPath != doc.Path {
+        if err := store.Docs.Rename(oldPath, doc); err != nil {
+            return errFailed("rename doc", err)
+        }
+        // ...
+    }
+    // ...
+}
+The Rename() function in doc_store.go performs file deletion:
+
+if oldAbsPath != newAbsPath {
+    if err := os.Remove(oldAbsPath); err != nil && !os.IsNotExist(err) {
+        return err
+    }
+}
+However, in internal/permissions/registry.go, docs.update is classified as CapWrite:
+
+"docs.update":  {Capability: CapWrite, Target: TargetDoc, Risk: RiskMedium},
+This allows an attacker with a read-write-no-delete preset (which permits CapWrite but denies CapDelete) to delete files by using docs.update with a newPath parameter.
+
+Attack Vector
+Phase	Request / Action	Effect
+1. Arbitrary File Read	docs.get with path="../../../victim/secret"	Server reads file outside project root via path traversal in DocStore.Get().
+2. Arbitrary File Write	docs.create with folder="../../../victim"	Server writes file outside project root via path traversal in DocStore.Create().
+3. Arbitrary File Delete	docs.update with path="../outside/secret.md" and newPath="../../../victim/renamed.md"	Server deletes file outside project root via path traversal in DocStore.Rename(). Bypasses CapDelete restriction because docs.update is classified as CapWrite.
+4. Memory File Read/Write	memory.update with id="x/../../../../victim/secret"	Server reads and overwrites file outside project root via path traversal in MemoryStore.Update().
+Analysis
+Classic Path Traversal Pattern
+Both DocStore and MemoryStore follow the same vulnerable pattern: user-controlled input is concatenated with a base directory using filepath.Join(), then passed directly to file system operations (os.ReadFile, os.WriteFile, os.Remove, os.Stat) without any validation.
+
+absPath := filepath.Join(baseDir, filepath.FromSlash(userInput))
+// No containment check: strings.HasPrefix(absPath, baseDir)
+// No rejection of ".." or absolute paths
+filepath.Join resolves ../ sequences, allowing attackers to escape the intended directory:
+
+Input: "../../../etc/passwd"
+Result: /project/.knowns/docs/../../../etc/passwd → /etc/passwd
+Rename-as-Delete Authorization Bypass
+The Rename() function performs two operations:
+
+Write the file to the new location (newAbsPath)
+Delete the file from the old location (oldAbsPath)
+Both paths are vulnerable to traversal. An attacker can:
+
+Set path to a file outside the project (e.g., "../../../victim/target.md")
+Set newPath to another location outside the project
+The Rename() function will delete the file at path (outside the project)
+Because docs.update is classified as CapWrite rather than CapDelete, this operation bypasses deletion restrictions in read-write-no-delete presets.
+
+Compounding Factor - Unauthenticated Access
+Due to the previously identified Auth Bypass vulnerability, all MCP tools are accessible without credentials when the server is started without a password, making this a zero-credential attack.

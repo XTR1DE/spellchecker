@@ -1,0 +1,8 @@
+Impact
+If an application method handler crashes, the error message is included in the status message sent to the client. This can leak to the client any sensitive data that may be included in the error message. This impacts anyone using @grpc/grpc-js to run servers.
+
+Patches
+This vulnerability is fixed in 1.13.6 and 1.14.5.
+
+Workarounds
+This can be avoided by using a top-level error handler in method handlers to strip out sensitive error information.

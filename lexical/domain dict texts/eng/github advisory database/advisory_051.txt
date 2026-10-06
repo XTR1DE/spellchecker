@@ -1,0 +1,18 @@
+Summary
+In the Astro Node adapter, a request whose Host header contains a malformed port (for example example.com:65536 or example.com:8080:8080) produced an invalid request URL. The fallback intended to recover from an unparseable URL reused the same malformed host, so it failed again and raised an uncaught TypeError: Invalid URL while the request was being built, before any route ran.
+
+Impact
+The effect depends on the adapter configuration:
+
+Default configuration (standalone): the request returns 500 Internal Server Error and the server continues running.
+With the opt-in staticHeaders: true option: the throw reaches a synchronous HTTP handler that does not catch it, becoming an uncaughtException that terminates the process.
+This is an availability-only issue. It does not expose data or allow code execution. Triggering it requires sending a hand-crafted Host header, and many proxies and CDNs reject malformed hosts before they reach the origin.
+
+Affected versions
+@astrojs/node <= 11.1.2.
+
+Patches
+Fixed in @astrojs/node 11.1.3. When the incoming host cannot be parsed, the request URL now degrades to a host the server controls, so the request is handled instead of throwing. Hosts carrying more than a single hostname:port pair are also rejected during host validation.
+
+Workarounds
+Upgrade to @astrojs/node 11.1.3 or later. Deployments that terminate malformed Host headers at a reverse proxy or CDN are not reachable through this path.

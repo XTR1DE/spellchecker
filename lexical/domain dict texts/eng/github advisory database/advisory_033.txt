@@ -1,0 +1,8 @@
+Impact
+An attacker who uses this vulnerability can craft a PDF which leads to long runtimes. This requires reading a PDF document with long indirect object headers, not terminated by whitespace.
+
+Patches
+This has been fixed in pypdf==6.18.0.
+
+Workarounds
+If you cannot upgrade yet, consider applying the changes from PR #4055.

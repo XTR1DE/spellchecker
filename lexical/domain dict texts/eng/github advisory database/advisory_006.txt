@@ -1,0 +1,113 @@
+vm2 current head (v3.11.5, commit 7a1f5100b96f48d34e0fe104ab37c0acc5944f92) still exposes registered Node.js internal symbols from host WebStream prototypes to sandbox code.
+
+The prior nodejs.* symbol hardening blocks Symbol.for('nodejs.<name>') at the source, but the extraction filters and bridge write traps still enumerate a fixed set of known registered symbols. On Node.js v25.8.0, stream/web exposes two additional registered symbols:
+
+nodejs.stream.disturbed
+nodejs.stream.errored
+Sandbox code can extract those real host symbols with Object.getOwnPropertySymbols(streamWeb.ReadableStream.prototype) and then use them as write keys on host objects. On a real host ReadableStream, an attacker can make stream.Readable.isDisturbed(stream) return false after the stream has already been read.
+
+Technical Details
+lib/setup-sandbox.js correctly blocks future nodejs.* keys at the Symbol.for() source:
+
+if (apply(localStringStartsWith, keyStr, ['nodejs.'])) {
+  ...
+  return fresh;
+}
+However, the extraction filters are still driven by a fixed realDangerousSymbols list. That list does not include nodejs.stream.disturbed or nodejs.stream.errored, so Object.getOwnPropertySymbols() and related paths can still return those real host symbols.
+
+lib/bridge.js has the same fixed-list problem in isDangerousCrossRealmSymbol() and in the host-result scrub list. Because the two new symbols are not recognized, the set and defineProperty traps allow sandbox-originated writes using those keys.
+
+Current-head source references:
+
+lib/setup-sandbox.js:180-196 denies Symbol.for('nodejs.*') by namespace.
+lib/setup-sandbox.js:214-230 uses a fixed realDangerousSymbols list for extraction filtering; the two reported symbols are absent.
+lib/bridge.js:187-199 uses a fixed isDangerousCrossRealmSymbol() list; the two reported symbols are absent.
+lib/bridge.js:1499-1509 treats the write trap as the last line of defense, but it only rejects keys recognized by that fixed list.
+Impact
+Sandbox code can corrupt host-visible WebStream state checks for host WebStream objects that cross into the sandbox. In the validated PoV, a stream that the host has already consumed is made to appear undisturbed to stream.Readable.isDisturbed().
+
+This can bypass host logic that relies on Node's public stream-state helpers to enforce one-shot body consumption, reject errored streams, or decide whether a host WebStream is safe to hand to another component.
+
+This is not a host-code-execution primitive in the current PoV. The report is an incomplete-fix / guard-coverage gap in the same symbol-boundary family as the prior nodejs.* symbol advisory.
+
+Affected Package/Versions
+Confirmed affected on Node.js v25.8.0:
+
+v3.11.4
+v3.11.5
+current head 7a1f5100b96f48d34e0fe104ab37c0acc5944f92
+v3.11.3 is also affected, but it predates the broader nodejs.* symbol fix. For this incomplete-fix report, the suggested affected range is >= 3.11.4, <= 3.11.5 on Node.js versions where these stream symbols exist.
+
+No patched version is known.
+
+Configuration Required
+The PoV uses a VM where the embedder exposes a host WebStream object and the host stream/web module object to sandbox code:
+
+const vm = new VM({ sandbox: { rs, streamWeb } });
+This matches the same trust boundary as the earlier cross-realm symbol-write class: sandbox code must not be able to obtain registered Node.js internal symbols and write them back onto host objects.
+
+The PoV is local-only. It does not require network access, a public target, NodeVM builtin access, process, filesystem access, or child-process access.
+
+Local Proof of Concept
+Run from the oss-zero-day-harness directory:
+
+node submission-bundle/vm2-pov-test-incomplete-nodejs-stream-symbol-filter/pov-nodejs-stream-symbol-incomplete-fix.js
+The PoV:
+
+The host creates a ReadableStream.
+The host reads one chunk so stream.Readable.isDisturbed(rs) is true.
+Sandbox code confirms Symbol.for('nodejs.stream.disturbed') is blocked and returns a sandbox-local symbol.
+Sandbox code extracts the real registered nodejs.stream.disturbed / nodejs.stream.errored symbols from the host ReadableStream.prototype.
+Sandbox code writes an own nodejs.stream.disturbed property onto the host stream with value false.
+The host calls stream.Readable.isDisturbed(rs) again and receives false.
+Observed result on current head:
+
+{
+  "beforeHostDisturbed": true,
+  "controls": {
+    "symbolForDisturbedIsRegistered": false,
+    "symbolForErroredIsRegistered": false
+  },
+  "extracted": [
+    {
+      "description": "nodejs.stream.disturbed",
+      "keyFor": "nodejs.stream.disturbed"
+    },
+    {
+      "description": "nodejs.stream.errored",
+      "keyFor": "nodejs.stream.errored"
+    }
+  ],
+  "overrideDisturbedOk": true,
+  "afterHostDisturbed": false
+}
+Official Disclosure Policy Fit
+vm2's SECURITY.md asks reporters not to create a public issue and to submit It asks for reproduction steps, affected versions, environment/configuration details, and potential impact:
+
+Policy: https://github.com/patriksimek/vm2/blob/main/SECURITY.md
+Private report route: https://github.com/patriksimek/vm2/security/advisories/new
+This bundle is formatted for that private GitHub report flow and should not be posted publicly before maintainer triage and a fixed release.
+
+Suggested Fix Direction
+Make the dangerous-symbol checks namespace-based instead of list-based:
+
+In setup-sandbox.js, make isDangerousSymbol(sym) return true for any registered symbol whose Symbol.keyFor(sym) starts with nodejs..
+In bridge.js, make isDangerousCrossRealmSymbol(key) do the same for any symbol key crossing the bridge.
+In host-result scrubbing, delete all own symbol keys whose registered key starts with nodejs. instead of iterating a hard-coded list.
+Keep the current explicit list only as regression documentation, not as the complete security boundary.
+Regression tests should include:
+
+Object.getOwnPropertySymbols(ReadableStream.prototype) must not expose nodejs.stream.disturbed or nodejs.stream.errored.
+A sandbox-local Symbol.for('nodejs.stream.disturbed') write must not affect host stream.Readable.isDisturbed().
+Even if the real symbol is passed into the sandbox by a host test harness, set, defineProperty, and deleteProperty traps must reject writes and deletes against host objects.
+Why This Is Not Intended Behavior
+The hardening comments and tests establish the intended invariant:
+
+any nodejs.* internal symbol should be sandbox-local when requested through Symbol.for();
+dangerous registered symbols should not be enumerable/extractable from host objects;
+even if a sandbox obtains one, bridge write traps should reject writes using that key.
+This report shows that the source-side rule is active, but the extraction and write-trap rules are incomplete for newer registered nodejs.stream.* symbols.
+
+Node's stream state helpers consult these symbols directly. For example, stream.Readable.isDisturbed() reads the internal disturbed symbol before falling back to public state. After sandbox writes an own property under the extracted symbol, the host helper returns attacker-controlled state.
+
+Node's public documentation describes stream.isErrored(stream) as reporting whether a stream has encountered an error, and stream.Readable.isDisturbed(stream) as reporting whether the stream has been read from or cancelled:

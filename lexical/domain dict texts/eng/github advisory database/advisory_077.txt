@@ -1,0 +1,38 @@
+Summary
+Axios for Node.js parses data: URLs in lib/helpers/fromDataURI.js. The current RFC-2397 parser uses a regular expression whose media type groups allow / inside both sides of the type/subtype match. A malformed data: URL containing many slashes and no comma forces the JavaScript regex engine to try many possible placements for the separator before failing.
+
+Applications are affected when they pass untrusted URL strings to axios and do not reject or constrain data: URLs before axios parses them.
+
+Impact
+An attacker can make the Node.js event loop spend significant synchronous CPU time parsing a single malformed URL. In a server that accepts a URL from an HTTP request and calls axios.get(url), this can block unrelated requests and health checks until parsing completes.
+
+The issue is availability-only. It does not disclose data or modify requests.
+
+Affected Functionality
+Affected:
+
+Node.js HTTP adapter data URL handling.
+axios.get() or equivalent calls where config.url has the data: protocol.
+Not affected:
+
+Browser fetch/XHR URL handling.
+Node requests where the application rejects data: URLs before calling axios.
+Older checked 0.x data URL parser shape unless separately proven vulnerable.
+Technical Details
+lib/helpers/fromDataURI.js contains:
+
+const DATA_URL_PATTERN = /^([^,;]+\/[^,;]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/;
+The [^,;]+ groups include /, so a long string of slashes without a comma can be partitioned around the required \/ in many ways before the match fails. The match runs before axios can apply request timeout behavior, so timeout does not mitigate the parsing pause.
+
+Local timing on axios 1.18.1 with small payloads showed about 2.4 ms at 1000 slashes, 16.6 ms at 3000 slashes, and 71.5 ms at 6000 slashes, consistent with the submitted quadratic scaling while avoiding long-running payloads.
+
+Proof of Concept of Attack
+Constrained helper-level demonstration:
+
+import axios from 'axios';
+
+await axios.get('data:' + '/'.repeat(6000));
+The request fails after parsing, but the failure is delayed by synchronous regex work. Larger payloads increase the pause substantially.
+
+Workarounds
+Reject data: URLs before passing untrusted input to axios, or enforce a strict maximum URL length for URL-fetching endpoints. Applications that do not need data: URL support should deny that protocol explicitly.

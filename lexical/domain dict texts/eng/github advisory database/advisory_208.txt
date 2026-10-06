@@ -1,0 +1,25 @@
+Language Servers for AWS (the aws/language-servers project) provide the underlying language-server runtime that powers Amazon Q Developer's AI coding assistance across its IDE plugins (Visual Studio Code, JetBrains, Eclipse, and
+Visual Studio).
+
+Improper trust boundary enforcement in Language Servers for AWS may allow for arbitrary code execution. If a local user opens a maliciously crafted workspace, any commands within the project configuration files may be automatically
+executed.
+
+Impact
+When a local user opens a maliciously crafted workspace and trusts it when prompted, commands defined in the workspace's project-level configuration files may be executed automatically, resulting in arbitrary code execution on the
+user's host.
+
+This issue is triggered when a user opens a workspace, trusts it, and the agent subsequently executes commands defined in the project-level configuration files.
+
+Impacted versions: Language Servers for AWS version <1.65.0.
+
+Patches
+This issue has been addressed in Language Servers for AWS version 1.65.0. We recommend upgrading to the latest version and ensuring any forked or derivative code is patched to incorporate the new fixes.
+
+Workarounds
+No workarounds are available.
+
+References
+If you have any questions or comments about this advisory, AWS Security asks that you contact them via their vulnerability reporting page or directly via email to aws-security@amazon.com. Please do not create a public GitHub issue.
+
+Acknowledgement
+AWS Security would like to thank Wiz and Maor Dokhanian for collaborating on this issue through the coordinated vulnerability disclosure process.

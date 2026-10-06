@@ -1,0 +1,14 @@
+Impact
+urllib3's streaming API is designed for efficiently handling large HTTP responses by reading the content in chunks, rather than loading the entire response body into memory at once. When decoding a chunked-transfer-encoded response, this API reads each chunk's size field by buffering until it sees \n or EOF.
+
+A malicious HTTP server can return Transfer-Encoding: chunked and then send a very long run of bytes without any newline, causing the streaming client to buffer that entire run before urllib3 can reject the chunk size as invalid and allocate more memory than intended.
+
+To fix the issue, we'll reject chunk-size fields larger than 65536 bytes, as already done in the non-streaming case, which is currently handled by the Python standard library. Note that this only applies to reading the chunk-size field, not the chunk data, which is already handled correctly. Thus, there shouldn't be any impact for non-malicious servers.
+
+Affected usages
+Applications and libraries using urllib3 versions earlier than 2.8.0 may be affected when streaming a chunked response from untrusted sources. Specifically, this affects the read_chunked() and stream() methods of the HTTPResponse object.
+
+This also affects requests streaming API, which uses urllib3 under the hood.
+
+Remediation
+Upgrade to urllib3 version 2.8.0 or later, where chunk-size fields larger than 65536 will be rejected. If upgrading is not immediately possible, consider reading the response at once using the read() method.

@@ -1,0 +1,52 @@
+nodemailer/lib/addressparser parses one shape of address in O(n^2) time. A single ~640 KB address value blocks the Node.js event loop for roughly 7 seconds. And it is reachable without auth: mailparser feeds inbound email headers straight into this parser, so one crafted email is enough to stall a service that parses mail.
+
+Details
+The parser builds a single address by accumulating its atoms into one string. When the atoms are separated by RFC 5322 comments, like a@b(c)@b(c)@b(c)..., every atom re-joins that same growing string.
+
+The join check in src/addressparser/index.ts:
+
+const joins =
+    prevToken &&
+    prevToken.noBreak &&
+    parts.length &&
+    (prevToken.value !== ')' || parts[parts.length - 1].slice(-1) === '@' || token.value.charAt(0) === '@');
+The issue is the order of the last two operands. parts[parts.length - 1].slice(-1) runs before the cheap token.value.charAt(0). slice(-1) has to flatten the accumulator to read its last character → O(current length) → and that runs on every token → O(n^2) over the whole value. Since || is left to right, the cheap charAt(0) that would short-circuit never gets the chance.
+
+The chain: long comment-joined address → one growing accumulator → slice(-1) re-flattens it on every token → quadratic parse time.
+
+PoC
+Isolated, just the parser (npm i nodemailer@10.0.3):
+
+const addressparser = require('nodemailer/lib/addressparser');
+const s = Date.now();
+addressparser('a' + '@b(c)'.repeat(130000));
+console.log(Date.now() - s, 'ms'); // ~7000 ms, blocking
+End to end through mailparser, the remote path (npm i mailparser@3.9.24):
+
+const { simpleParser } = require('mailparser');
+(async () => {
+  const to = 'a' + '@b(c)'.repeat(130000);
+  const eml = `From: a@b.com\r\nTo: ${to}\r\nSubject: x\r\n\r\nhi\r\n`;
+  const s = Date.now();
+  await simpleParser(eml);
+  console.log(Date.now() - s, 'ms'); // ~7000 ms, blocking
+})();
+Timings measured on 10.0.3:
+
+Address value	Parse time
+390 KB	1.3 s
+585 KB	5.6 s
+640 KB	6.7 s
+976 KB	18 s
+It survives RFC 5322 folding: fold the header at offsets that are a multiple of the atom length and every )+@ junction stays intact, so the payload is a standards-compliant email with lines under 998 octets and still triggers it.
+
+Impact
+Algorithmic-complexity DoS. Node is single threaded, so the block stalls everything else in the process, and a handful of these back to back keeps a service down.
+
+Affected: anything that runs addressparser on attacker-controlled input, either the public export directly or address headers built from user input. The unauthenticated remote case is mailparser. 3.9.24 pins nodemailer 10.0.3 and calls the parser on inbound To/From/Cc with no length cap, so any service parsing inbound mail with it can be frozen by a single email.
+
+Suggested fix
+Swap the last two operands so the cheap check runs first:
+
+(prevToken.value !== ')' || token.value.charAt(0) === '@' || parts[parts.length - 1].slice(-1) === '@')
+Pure boolean commutation, so the parse output is identical. Verified byte for byte on the test inputs, and the full 1276-test suite passes.

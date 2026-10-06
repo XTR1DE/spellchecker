@@ -1,0 +1,153 @@
+Summary
+GitPython's Actor.name_email_regex regular expression (git/util.py, line 863)
+is vulnerable to catastrophic backtracking (ReDoS — Regular Expression Denial of
+Service). When GitPython parses the author or committer header of a git commit
+object that contains a long string with an unterminated < (no matching >), the
+Python regex engine enters quadratic backtracking, causing complete single-threaded
+CPU exhaustion proportional to the square of the input length.
+
+A single crafted commit object can block any GitPython API call that reads
+.author or .committer for over two minutes per invocation, enabling denial
+of service against CI runners, code-hosting backends, repository-scanning
+pipelines, or any service that processes commits from third-party or untrusted
+repositories.
+
+Details
+Vulnerable file and line:
+
+git/util.py, line 863:
+
+name_email_regex = re.compile(r"(.*) <(.*?)>")
+This regex is evaluated inside Actor._from_string() (line 909) every time
+GitPython resolves a commit's .author or .committer property.
+
+Full call chain — from public API to vulnerable sink:
+
+commit.author # any ordinary GitPython API call
+└── git/objects/commit.py:917
+Commit._deserialize()
+└── git/objects/util.py:341
+parse_actor_and_date(author_line)
+└── git/util.py:909
+Actor._from_string(string)
+└── Actor.name_email_regex.search(string) ← VULNERABLE
+
+author_line is decoded directly from the raw bytes of the git commit object with
+no length limit, character restriction, or timeout applied at any point before
+reaching the regex engine. The same chain is triggered by:
+
+commit.author
+commit.committer
+repo.iter_commits()
+repo.blame()
+Any web service / CI tool that displays or processes commit metadata
+Why this pattern backtracks catastrophically:
+
+The pattern (.*) <(.*?)> contains an unbounded greedy group (.*) followed by
+a literal space and <. When the input is a long string that contains < but no
+closing >, the regex engine must try every possible split position for the greedy
+group — O(n²) candidate positions for a string of length n — each of which then
+drives the inner lazy group into further sub-match attempts. This is the
+well-documented "catastrophic backtracking" failure mode for this family of
+patterns.
+
+Empirically measured scaling (tested against GitPython 3.1.59, commit 52a6cba):
+
+Author field length (bytes)	Time to resolve .author
+1,000	0.0035 s
+5,000	0.084 s
+10,000	0.341 s
+20,000	1.525 s
+40,000	5.963 s
+60,000	13.360 s
+80,000	23.871 s
+200,000	150.488 s
+Each doubling of input size roughly quadruples processing time (e.g. 40,000 →
+80,000 bytes: 5.96 s → 23.87 s ≈ 4.0×), confirming O(n²) growth. Git itself
+imposes no practical size limit on author name fields in the object format.
+
+How the malicious object reaches a victim:
+
+The PoC creates the commit object as a correctly SHA-1-hashed, zlib-compressed git
+loose object written directly into .git/objects/. git cat-file -t <sha> confirms
+it is a valid commit type and git's own read-side tools display it without error.
+Only git's write-side tooling (git commit --author, git update-index,
+explicit git fsck) applies the sanity checks that would reject a malformed author
+line. Delivery paths that bypass those checks include:
+
+A git server with receive.fsckObjects = false (common in self-hosted deployments)
+A .git directory shipped as a tarball, backup, or zip archive
+A git bundle file
+Any automated mirror or import tool that operates at the object level
+
+Execution and observed output:
+
+$ python3 craft_malicious_repo.py /tmp/victim-repo 200000
+Malicious commit sha : 2450fbd5ab5ebfff430dab183d25678df9fd20de
+Payload size : 200000 bytes
+git cat-file -t confirms: commit
+
+$ python3 trigger_redos.py /tmp/victim-repo 2450fbd5ab5ebfff430dab183d25678df9fd20de
+Accessing commit.author — triggers Actor._from_string()...
+Author name length : 200014 chars
+Elapsed : 150.488 seconds
+RESULT: VULNERABLE
+
+Docker reproduction (fully isolated environment):
+
+docker run --rm -it -v ~/gitpython-poc:/work -w /work python:3.8-bookworm bash
+
+# Inside the container:
+apt-get update && apt-get install -y git
+git clone --depth 1 https://github.com/gitpython-developers/GitPython.git /work/GitPython
+pip install -e /work/GitPython
+
+python3 /work/poc/craft_malicious_repo.py /work/victim-repo 200000
+# note the SHA printed, then:
+python3 /work/poc/trigger_redos.py /work/victim-repo <SHA>
+The python:3.8-bookworm base image matches the one used in GitPython's own
+fuzzing/local-dev-helpers/Dockerfile.
+
+Impact
+Who is affected:
+
+Any application that uses GitPython to parse commits from a source it does not
+fully control. High-risk deployments include:
+
+CI/CD systems (Jenkins, GitLab CI, GitHub Actions self-hosted runners, etc.)
+that clone and inspect third-party pull requests — one malicious commit in a PR
+can stall every worker that processes it.
+Code-hosting or code-review web services that render commit author information
+— a single crafted push blocks every page render or API response that touches that
+commit's metadata.
+Security or compliance scanners that walk repository history across many
+repositories — one crafted object in any repository exhausts a scanner worker.
+Severity of impact:
+
+A 200 KB author field blocks a process for ~150 seconds per single .author
+access. When iter_commits() or blame are used, every commit in a history
+traversal can be independently crafted, multiplying the total hang time by the
+number of commits processed. There is no confidentiality or integrity impact —
+this is a pure availability / resource-exhaustion vulnerability.
+
+Suggested Fix
+Replace the vulnerable pattern with one that cannot backtrack catastrophically.
+The minimal, behavior-preserving fix is to exclude < and > from the name
+group, removing the ambiguity that forces O(n²) backtracking:
+
+# git/util.py, line 863
+# Before (vulnerable):
+name_email_regex = re.compile(r"(.*) <(.*?)>")
+
+# After (fixed — identical output for all well-formed input):
+name_email_regex = re.compile(r"([^<>]*) <([^<>]*)>")
+Because the name group can no longer itself contain a < character, the engine
+has exactly one candidate position to try when a closing > is absent — and fails
+in O(n) time instead of O(n²). Legitimate actor strings (Name <email>) never
+contain < or > in either field, so this change produces identical results for
+all valid input.
+
+As defense in depth, independently of the regex fix, bounding the maximum number
+of characters GitPython will attempt to parse in an author/committer line (e.g.
+rejecting strings longer than 4096 bytes before passing them to any regex) would
+further limit the blast radius of any future ReDoS class in this parser.

@@ -1,0 +1,24 @@
+Summary
+The fix shipped for CVE-2026-39244 (methods/inflater.js) caps zlib's decompression output via maxOutputLength: expectedLength, where expectedLength is read directly from the ZIP entry's attacker-controlled "uncompressed size" header field (CENLEN/LOCLEN). This cap is only applied when expectedLength > 0:
+
+const option = version >= 15 && expectedLength > 0 ? { maxOutputLength: expectedLength } : {};
+return zlib.inflateRawSync(inbuf, option);
+If an attacker sets the declared uncompressed-size field to exactly 0, this condition is false, option becomes {}, and no output cap is passed to zlib at all. Node then falls back to zlib's own internal default limit (several GB), so a small, highly-compressible payload can still be decompressed to a very large size in memory -- the same class of resource-exhaustion issue the original CVE addressed, just triggered differently.
+
+Steps to Reproduce
+Build a ZIP archive containing one DEFLATE-compressed entry whose real content is highly redundant (e.g. several MB of a repeated byte, achieving close to the ~1032:1 theoretical raw-DEFLATE compression ratio).
+Patch the entry's declared uncompressed-size fields (both the local file header copy and the central directory copy, 4-byte little-endian values) to 0. The compressed bytes and CRC32 are left untouched -- CRC validation still passes because CRC is computed over the real decompressed output, not the declared size.
+Load the archive with new AdmZip(buffer) and call .getEntries()[0].getData() (or readFile/readAsText/extractAllTo/etc. -- all share the same code path).
+Observe: decompression succeeds and returns the full-size buffer with no size restriction applied, whereas the same real data with an honest (but undersized) declared value correctly throws Cannot create a Buffer larger than N bytes.
+Proof of Concept
+Attached script demonstrates a controlled A/B comparison using the identical real payload in both cases -- only the declared-size header field differs:
+
+Control (declared size = 1024 bytes, deliberately smaller than the true 4MB output): correctly throws, proving the cap mechanism works when expectedLength > 0.
+Bypass (declared size = 0, identical real payload): succeeds and returns the full 4,194,304-byte buffer with zero restriction.
+Verified reproducible across 3 independent runs.
+
+Impact
+Any application that calls adm-zip's read/extract methods on an untrusted ZIP file (upload handlers, CI artifact extraction, email attachment scanning, etc.) can be made to allocate an amount of memory bounded only by zlib's own internal default rather than any limit the application or adm-zip intends -- a small (tens-of-MB) upload can trigger multi-GB memory consumption, risking process crash/OOM.
+
+Suggested Fix
+Apply maxOutputLength unconditionally (e.g. defaulting to a sane absolute ceiling, or always passing the declared size regardless of whether it's 0), and/or add an independent compression-ratio check that doesn't rely solely on the attacker-supplied size field.

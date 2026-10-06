@@ -1,0 +1,96 @@
+Summary
+Nodemailer's address parser can produce an unexpected recipient address when an RFC 5322 comment follows the domain of an address whose local-part is a quoted string.
+
+For example:
+
+"user"@example.com(x)evil.com
+is parsed as:
+
+{
+  address: "user@example.com evil.com",
+  name: ""
+}
+The resulting address therefore contains additional attacker-controlled domain text separated by a literal space.
+
+The parsed .address value is subsequently propagated into the SMTP envelope:
+
+src/addressparser/index.ts
+        ↓
+recipient.address
+        ↓
+src/mime-node/index.ts
+        ↓
+envelope.to
+The envelope construction uses the parsed address without another strict address validation step.
+
+This appears to be a variant of the RFC 5322 comment parsing issue addressed by GHSA-cc9r-2j5m-2m83, but it follows a different parser path when the local-part is quoted.
+
+Reproduction
+Input:
+
+"user"@example.com(x)evil.com
+Observed parser output:
+
+address: "user@example.com evil.com"
+name: ""
+A second example:
+
+"a"@b.com(c)d.com(e)f.com
+produces:
+
+address: "a@b.com d.com f.com"
+name: ""
+For comparison, the corresponding unquoted form:
+
+user@example.com(x)evil.com
+takes a different code path and is handled by the existing protection differently.
+
+Technical Details
+The issue is caused by different parsing behavior for quoted and unquoted local-parts.
+
+The quoted-local-part variant allows the comment-separated trailing domain atoms to remain in the resulting .address value.
+
+That value is then used when constructing the message envelope:
+
+envelope.to = recipients.map(to => to.address as string)
+No additional strict recipient validation is performed at this boundary.
+
+Security Impact
+The confirmed impact is that attacker-controlled comment content can result in a malformed/ambiguous recipient address being accepted by the parser and propagated into envelope.to.
+
+The reporter did not confirm successful delivery to an unintended recipient through a real SMTP server using this exact quoted-local-part variant.
+
+The remaining question is how real SMTP servers and other Nodemailer transports handle an envelope recipient containing a value such as:
+
+user@example.com evil.com
+An end-to-end SMTP test is required to determine whether this parser behavior results in an exploitable delivery or recipient-validation bypass.
+
+Relationship to GHSA-cc9r-2j5m-2m83
+This report is intended as a potential variant/follow-up to GHSA-cc9r-2j5m-2m83.
+
+The existing advisory addresses RFC 5322 comment handling in email domains. This report identifies a separate parser path involving quoted local-parts that can preserve additional domain-like content in the normalized address.
+
+Please evaluate whether this behavior is already covered by the existing fix or represents a remaining parser variant.
+
+Suggested Fix
+The parser should consistently reject or correctly terminate addresses containing trailing domain atoms after RFC 5322 comments, regardless of whether the local-part is quoted.
+
+In particular:
+
+"user"@example.com(x)evil.com
+should not result in:
+
+user@example.com evil.com
+The envelope-generation layer should also avoid assuming that a parser-produced address is safe for SMTP delivery without appropriate validation.
+
+Verification Status
+Confirmed:
+
+Parser accepts the quoted-local-part variant.
+Parser produces an address containing additional attacker-controlled text.
+The resulting address is propagated into envelope.to.
+Not confirmed by reporter:
+
+Successful delivery through a real SMTP server.
+Delivery to an unintended recipient.
+Exploitability against a specific downstream SMTP implementation.

@@ -1,0 +1,45 @@
+Summary
+Axios contains a guard in the Node HTTP adapter to avoid using an inherited Object.prototype.getHeaders as a FormData header source. The fetch adapter calls the shared resolveConfig() helper before dispatch, and that helper lacks the same guard. If another vulnerability pollutes Object.prototype with FormData-like properties and getHeaders(), the fetch adapter can merge attacker-controlled headers into the outbound request.
+
+Axios does not create the prototype pollution source. This is a read-side gadget in the fetch adapter configuration path.
+
+Impact
+An attacker with a prior same-process prototype-pollution primitive can inject headers into fetch-adapter requests. Depending on the target service, this may affect authorization, metadata-service access, cache behavior, conditional request handling, or other application-specific header logic.
+
+Plain objects are blocked by current FormData detection. The confirmed path uses arrays or non-plain class instances whose prototype chain can resolve polluted FormData-like properties.
+
+Affected Functionality
+Affected:
+
+Fetch adapter requests.
+resolveConfig() handling of utils.isFormData(data).
+Request bodies that can be spoofed as FormData through inherited Symbol.toStringTag, append, and getHeaders.
+Not affected:
+
+Node HTTP adapter's later FormData header path, which checks data.getHeaders !== Object.prototype.getHeaders.
+Plain object request bodies rejected by current isFormData() plain-object guard.
+Processes without prototype pollution.
+Technical Details
+lib/helpers/resolveConfig.js currently contains:
+
+if (utils.isFormData(data)) {
+  if (platform.hasStandardBrowserEnv || platform.hasStandardBrowserWebWorkerEnv || utils.isReactNative(data)) {
+    headers.setContentType(undefined);
+  } else if (utils.isFunction(data.getHeaders)) {
+    setFormDataHeaders(headers, data.getHeaders(), own('formDataHeaderPolicy'));
+  }
+}
+Unlike lib/adapters/http.js, this code does not reject Object.prototype.getHeaders. Local verification on axios 1.18.1 polluted Object.prototype[Symbol.toStringTag], append, and getHeaders, then sent an array body with adapter: 'fetch'. The loopback server received X-Poisoned: yes.
+
+Proof of Concept of Attack
+Constrained local demonstration:
+
+Object.prototype[Symbol.toStringTag] = 'FormData';
+Object.prototype.append = function () {};
+Object.prototype.getHeaders = () => ({ 'X-Poisoned': 'yes' });
+
+await axios.post(url, ['a', 'b'], { adapter: 'fetch' });
+Expected safe behavior is that inherited Object.prototype.getHeaders is ignored. Current affected behavior merges the returned header.
+
+Workarounds
+Use the Node HTTP adapter for server-side requests that may run in a polluted process. Avoid passing array or class-instance bodies through the fetch adapter when prototype pollution is suspected.

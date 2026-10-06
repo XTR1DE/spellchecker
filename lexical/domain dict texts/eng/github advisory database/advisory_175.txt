@@ -1,0 +1,17 @@
+Impact
+A Stored Cross-Site Scripting (XSS) vulnerability exists in the rich text editor due to improper sanitization of the srcdoc attribute on <iframe> elements.
+
+While the underlying Symfony HtmlSanitizer correctly HTML-encodes special characters inside the attribute value (e.g., converting <script> to <script>), the HTML specification mandates that browsers automatically decode HTML entities inside attribute values before processing them. As a result, any encoded JavaScript inside a srcdoc attribute is evaluated and executed as live HTML/JS in the context of the iframe when the page is rendered.
+
+An attacker with permissions to edit an Editor field can inject malicious scripts to target other users viewing the content. Potential impacts include:
+
+Session Hijacking (stealing admin session cookies via document.cookie)
+Account Takeover & Privilege Escalation (e.g., a low-privileged editor triggering actions as an Administrator)
+Admin panel data theft
+Patches
+The vulnerability has been patched in version v9.22.5.
+
+The fix explicitly removes srcdoc from the list of allowed iframe attributes in src/Utils/Sanitization/FormatsSanitizedValue.php.
+
+Workarounds
+Users who cannot upgrade immediately can manually sanitize all content of editor fields to strip srcdoc attributes.

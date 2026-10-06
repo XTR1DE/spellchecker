@@ -1,0 +1,110 @@
+Summary
+The AetherBrowser API server (scripts/aetherbrowser/api_server.py) exposes the POST /api/ops/check-email endpoint without any authentication. Any remote attacker can call this endpoint and trigger execution of the email_reader.py subprocess, which connects to configured ProtonMail or Gmail accounts via IMAP and returns email metadata (sender, subject, body snippet) in the JSON response. The server binds to 0.0.0.0:8100 by default with CORS set to allow_origins=["*"], making it reachable from any network or browser origin. This constitutes a critical information-disclosure vulnerability.
+
+Details
+scripts/aetherbrowser/api_server.py registers the following route at line 3008 (report excerpt references line 2987; the actual line is 3008):
+
+@app.post("/api/ops/check-email")
+async def ops_check_email():
+    script = ROOT / "scripts" / "apollo" / "email_reader.py"
+    result = await asyncio.to_thread(
+        _run_subprocess,
+        [sys.executable, str(script)],
+        timeout=30,
+    )
+    return {
+        "output": result.get("stdout", "")[:2000],
+        ...
+    }
+No Depends() guard, middleware check, or API-key validation is applied. The decorator is a plain @app.post(...), so FastAPI registers the route with zero access control.
+
+The server is bound to all interfaces (line 4065/4070):
+
+uvicorn.run(app, host="0.0.0.0", port=port)   # default port 8100
+CORS middleware is configured to allow any origin (lines 486–492):
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    ...
+)
+When the endpoint is called, email_reader.py is executed as a subprocess. It loads mail credentials from config/connector_oauth/.env.connector.oauth (line 29–34 of email_reader.py):
+
+# loads PROTONMAIL_BRIDGE_PASSWORD, GMAIL_APP_PASSWORD, etc.
+With credentials present, the script connects via IMAP, fetches full RFC822 messages, and prints sender, subject, and a body snippet to stdout (lines 273–299). The API then returns the first 2000 characters of that stdout to the unauthenticated caller as JSON.
+
+Complete data-flow path:
+
+api_server.py:4065+4070 — server starts on 0.0.0.0:8100
+api_server.py:486–492 — CORS allow_origins=["*"] permits cross-origin requests
+api_server.py:3008 — POST /api/ops/check-email registered without auth
+api_server.py:3011–3023 — _run_subprocess([sys.executable, str(script)]) invoked; stdout captured
+email_reader.py:29–34 — connector env file loaded, credentials extracted
+email_reader.py:378–394 — IMAP login using PROTONMAIL_BRIDGE_PASSWORD / GMAIL_APP_PASSWORD
+email_reader.py:273–299 — RFC822 messages fetched; sender, subject, snippet printed to stdout
+api_server.py:3023 — stdout[:2000] returned in JSON response to caller
+Even without credentials configured, the subprocess executes and returns its banner output, confirming the unauthenticated code path reaches the sensitive subprocess invocation.
+
+PoC
+Prerequisites:
+
+Docker installed on the attacker or test machine.
+Repository source available under repo/ within the build context.
+Step 1 — Build the Docker image:
+
+docker build -t vuln001-aetherbrowser -f vuln-001/Dockerfile .
+The Dockerfile (vuln-001/Dockerfile) installs fastapi, uvicorn, and pydantic, copies the repository source, and starts scripts/aetherbrowser/api_server.py on port 8100.
+
+Step 2 — Start the container:
+
+docker run --rm -d --name vuln001-test -p 8100:8100 vuln001-aetherbrowser
+Step 3 — Run the PoC script:
+
+python3 vuln-001/poc.py --host 127.0.0.1 --port 8100
+Or send the request manually with no authentication headers:
+
+curl -s -X POST http://127.0.0.1:8100/api/ops/check-email \
+  -H 'Content-Type: application/json' \
+  -d '{}'
+Expected result (no credentials configured):
+
+{
+  "output": "APOLLO EMAIL READER\n============================================================\n  [ProtonMail] No PROTONMAIL_BRIDGE_PASSWORD set\n  [Gmail] No GMAIL_APP_PASSWORD set\n\nNo emails found.\n",
+  "exit_code": 0,
+  "errors": null
+}
+HTTP status 200 is returned with no 401 or 403, and the subprocess stdout appears in the response. In a production deployment with PROTONMAIL_BRIDGE_PASSWORD or GMAIL_APP_PASSWORD set, the response would contain real email metadata (senders, subjects, body snippets).
+
+Dynamic test result (Phase 2):
+
+The Phase 2 dynamic test confirmed HTTP 200 with the APOLLO EMAIL READER banner in the response body. Server access log showed "POST /api/ops/check-email HTTP/1.1" 200 OK from an unauthenticated source. The subprocess was executed without any authentication gate being triggered.
+
+Remediation:
+
+Add a mandatory API-key dependency to all /api/ops/* routes:
+
+-from fastapi import FastAPI, HTTPException, Query, Request
++from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+
++def require_ops_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
++    expected = os.environ.get("AETHERBROWSER_OPS_API_KEY", "").strip()
++    if not expected:
++        raise HTTPException(
++            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
++            detail="ops endpoints disabled: AETHERBROWSER_OPS_API_KEY is not configured",
++        )
++    if not x_api_key or not hmac.compare_digest(x_api_key, expected):
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid ops API key")
+
+-@app.post("/api/ops/check-email")
++@app.post("/api/ops/check-email", dependencies=[Depends(require_ops_api_key)])
+ async def ops_check_email():
+Additionally, the server should default to 127.0.0.1 instead of 0.0.0.0, and stdout from operational subprocesses should never be returned verbatim to callers.
+
+Impact
+An unauthenticated remote attacker who can reach port 8100 of a deployed SCBE-AETHERMOORE instance can:
+
+Exfiltrate operator email metadata: sender addresses, email subjects, and body snippets from the operator's ProtonMail or Gmail inbox are disclosed in the response.
+Enumerate mail configuration: even without active credentials, the API reveals which mail providers are configured and prints diagnostic output from internal tooling.
+Trigger repeated IMAP sessions: repeated calls to the endpoint cause repeated IMAP logins using the stored credentials, potentially generating account alerts or exhausting connection limits.
+The vulnerability affects any deployment where scripts/aetherbrowser/api_server.py is running and reachable from an untrusted network. Because the server binds to 0.0.0.0 by default with wildcard CORS, cloud deployments and developer machines with exposed ports are directly affected. No credentials, tokens, or prior knowledge of the application are required by the attacker.

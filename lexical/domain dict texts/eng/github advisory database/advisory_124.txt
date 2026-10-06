@@ -1,0 +1,8 @@
+Impact
+undici's interceptors.cache() does not handle Set-Cookie in the cache path. In shared-cache mode (type: 'shared', the default), a cacheable response (for example Cache-Control: public, max-age=...) carrying a Set-Cookie header is stored, and the stored Set-Cookie is re-served to a later caller that hits the same cache key. This exposes one user's cookie to another caller and lets an untrusted upstream inject cookies into cached responses served to all subsequent callers, violating RFC 6265 section 7.2 (a shared cache must not store cookies). Applications using the shared cache interceptor against untrusted or multi-user upstreams are affected. Private caches (type: 'private') are not affected.
+
+Patches
+Upgrade to 7.29.1 or 8.10.2. In shared-cache mode, undici no longer stores or re-serves responses containing Set-Cookie, including previously cached entries and revalidation paths.
+
+Workarounds
+Use a private cache (type: 'private') for per-user responses, or avoid caching responses that set cookies. Applications acting as shared caches should strip Set-Cookie from responses before caching.

@@ -1,0 +1,8 @@
+Impact
+The interceptors.decompress() interceptor decompresses HTTP response bodies according to the untrusted Content-Encoding header. The number of decompression layers is capped at 5, but the total decompressed output size is not bounded and there is no option to limit it. A malicious or faulty upstream can return a small compressed payload (a compression bomb) that expands to hundreds of megabytes or gigabytes in client memory, exhausting memory and causing the Node.js process to crash or become unresponsive. Any application using the decompress interceptor to read responses from untrusted or compromised upstreams is affected.
+
+Patches
+Upgrade to 7.29.1 or 8.10.2. The interceptor now accepts a maxSize option (default 64 MiB) and rejects responses whose decompressed output exceeds it with a ResponseExceededMaxSizeError.
+
+Workarounds
+Once upgraded, set a conservative maxSize on the interceptor. Before upgrading, avoid using interceptors.decompress() with untrusted upstreams, or apply a custom interceptor that enforces a decompressed output size limit.

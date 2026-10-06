@@ -1,0 +1,10 @@
+Impact
+The undici WebSocket client throws an uncaught TypeError during the opening handshake when a server's 101 response includes a Sec-WebSocket-Protocol header that the client never requested. The throw occurs in a queueMicrotask callback with no surrounding try/catch, so it propagates as an uncaught exception and terminates the Node.js process. This is a remote, unauthenticated denial of service against any application that opens a WebSocket to an attacker controlled or compromised server, or over a plaintext ws:// connection subject to a machine-in-the-middle. It affects the default new WebSocket(url) usage, where no subprotocol is requested. Per RFC 6455 section 4.1, an unrequested subprotocol must fail the connection, not crash it.
+
+All releases starting at undici 6.7.0 are affected.
+
+Patches
+Upgrade to undici 6.28.1, 7.29.1, or 8.10.2.
+
+Workarounds
+No workaround is available. The fix must be applied through an upgrade.

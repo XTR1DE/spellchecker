@@ -1,0 +1,42 @@
+Summary
+Axios shouldBypassProxy() normalizes hostnames with hostname.replace(/\.+$/, ''). For a hostname shaped as many dots followed by a non-dot, the anchored regex can perform quadratic backtracking. Because axios re-evaluates proxy bypass rules for redirected requests, a malicious server can trigger this synchronous work through a crafted redirect Location.
+
+The issue affects Node.js applications that use environment proxy variables with NO_PROXY and allow redirects.
+
+Impact
+An attacker-controlled server can return a redirect whose hostname causes the axios process to spend significant CPU time in synchronous hostname normalization. During this time, the Node.js event loop is blocked and the application cannot handle other work on that thread.
+
+This is an availability-only issue. It does not disclose request data or modify requests.
+
+Affected Functionality
+Affected:
+
+Node.js HTTP adapter.
+Environment proxy handling through HTTP_PROXY or HTTPS_PROXY.
+NO_PROXY or no_proxy set to a non-empty value.
+Redirects followed by axios or follow-redirects.
+Not affected:
+
+Browser adapters.
+Requests with proxy: false.
+Requests with no NO_PROXY value.
+Requests with maxRedirects: 0, unless application code manually follows the malicious redirect and re-enters axios.
+Technical Details
+lib/helpers/shouldBypassProxy.js contains:
+
+return unmapIPv4MappedIPv6(hostname.replace(/\.+$/, ''));
+When the hostname is "." * n + "a", the $ anchor causes the regex engine to retry the dot run from many positions before it fails. setProxy() invokes shouldBypassProxy(location) after getProxyForUrl(location) returns a proxy, including on redirect hops via beforeRedirects.proxy.
+
+Local timing on axios 1.18.1 showed increasing cost for crafted hostnames: about 1 ms at 1000 dots, 6.9 ms at 3000 dots, and 34.5 ms at 6000 dots. The growth is consistent with the submitted quadratic claim while avoiding long-running payloads.
+
+Proof of Concept of Attack
+Constrained helper-level demonstration:
+
+import shouldBypassProxy from 'axios/lib/helpers/shouldBypassProxy.js';
+
+process.env.NO_PROXY = 'example.com';
+shouldBypassProxy('http://' + '.'.repeat(6000) + 'a/');
+In the full adapter path, a malicious server can return that hostname in a 302 Location header while the client has proxy environment variables and NO_PROXY configured.
+
+Workarounds
+Disable automatic redirects for requests to untrusted servers, or avoid environment proxy handling for those requests with proxy: false when appropriate. Operators can also avoid broad untrusted redirect-following in services where event-loop availability is critical.

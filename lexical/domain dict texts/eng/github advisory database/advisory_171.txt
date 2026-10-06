@@ -1,0 +1,22 @@
+Impact
+Two locations consume an encrypted handle returned by an untrusted external party and use it without verifying that the party is ACL-authorized on it.
+
+VestingWalletConfidential
+Malicious users can call release with a malicious token. This token could return an alternative handle on confidentialBalanceOf, which represents the balance of the vesting wallet on an alternative ERC-7984 token (or any other handle that the vesting wallet has access to). The vesting wallet does not check that the token has ACL access and grants access to a new handle derived from the returned handle.
+
+Effectively, this bug allows a malicious user to gain information about any private euint64 handle that the vesting wallet has access to via a malicious ERC-7984 token. There is no loss of funds.
+
+ERC7984
+On a transfer with callback, ERC7984 uses the ebool returned by the
+recipient's IERC7984Receiver.onConfidentialTransferReceived to drive the refund
+logic, without checking that the recipient has ACL access to it. A malicious recipient
+can return any ebool the token has access to and recover its plaintext from the
+refund result, which the token grants the caller access to. The leak is limited
+to ebool handles (the value is only used as an FHE.select condition), and
+there is no loss of funds.
+
+Patches
+Both issues were fixed in the same patch releases: v0.5.2, v0.4.2, v0.3.2
+
+VestingWalletConfidential: 93e75ceed2b9648f53f9d133f431064353456805 (#423).
+ERC7984 transfer callback: fe0863af2c9dce7614acce98720a913bf6a767a5 (#428), with follow-up ee47edf189ab681cebdad18bfb53dee541987be2 (#431) permitting an uninitialized returned handle.

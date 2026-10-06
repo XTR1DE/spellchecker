@@ -1,0 +1,56 @@
+Related public issue (context, not a duplicate)
+Closed issue #1429 ("Handle non-UTF-8 paths", 2024-03-24) raised exactly this general concern and
+even suggested detection via preg_match('//u', $path) !== 1 -- note the reporter's suggested check
+explicitly compares !== 1, which would correctly treat PCRE's false return as "reject." The
+maintainer's reply pointed to the PathNormalizer interface as the place to implement this. The
+control-character check that ended up shipping in WhitespacePathNormalizer
+(if (preg_match('#\p{C}+#u', $unixPath))) addresses the general concern but does not use the
+!== 1-style comparison the original issue suggested -- it uses a bare truthy check, which is exactly
+the gap this report demonstrates. So this is not a duplicate of #1429; it's a concrete bypass
+surviving in the fix that issue's concern led to.
+
+Vulnerability Details
+File: src/WhitespacePathNormalizer.php, lines 22-28 (normalizePath()) -- the default
+PathNormalizer used by Filesystem for every adapter (Local, FTP, SFTP, S3, AsyncAwsS3, Azure, GCS,
+ZipArchive, GridFS, InMemory) unless the application supplies a custom one.
+
+Root Cause
+public function normalizePath(string $path): string
+{
+    $unixPath = str_replace('\\', '/', $path);
+
+    if (preg_match('#\p{C}+#u', $unixPath)) {
+        throw CorruptedPathDetected::forPath($path);
+    }
+    ...
+preg_match() returns false (a PHP engine error) rather than 0 when the subject string is not
+valid UTF-8 and the pattern uses the /u modifier -- PCRE can't even attempt the match. false and
+0 are both falsy in PHP, and if (preg_match(...)) does not distinguish them. So a path containing
+any single invalid UTF-8 byte anywhere in the string makes preg_match() fail with a "Malformed
+UTF-8 characters" engine error, the if evaluates false, and CorruptedPathDetected is silently not
+thrown -- even when the same string also contains literal control characters this exact check exists
+to catch.
+
+the identical payload IS correctly rejected once it's valid UTF-8:
+
+$n->normalizePath("foo\x1bbar");         // valid UTF-8, contains ESC -> throws CorruptedPathDetected (correct)
+$n->normalizePath("foo\x80\x1bbar");    // 0x80 = invalid lone UTF-8 continuation byte -> NOT thrown (bypass)
+The path-traversal protection is unaffected -- it's exact byte-string comparison on
+/-delimited segments, independent of UTF-8 validity:
+
+$n->normalizePath("\x80/../../etc/passwd");   // still throws PathTraversalDetected
+Recommended Fix
+public function normalizePath(string $path): string
+{
+    $unixPath = str_replace('\\', '/', $path);
+    $matched = preg_match('#\p{C}+#u', $unixPath);
+
+    if ($matched !== 0) {
+        // $matched === false means malformed UTF-8 -- must also be treated as corrupted,
+        // not silently allowed through.
+        throw CorruptedPathDetected::forPath($path);
+    }
+    ...
+Verification
+Dynamically confirmed on league/flysystem HEAD 6837e1d / tag 3.35.2, PHP 8.4.22 CLI, end-to-end
+through LocalFilesystemAdapter:

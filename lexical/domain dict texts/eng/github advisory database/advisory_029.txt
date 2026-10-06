@@ -1,0 +1,8 @@
+Impact
+An attacker who uses this vulnerability can craft a PDF which leads to large memory consumption. This requires accessing the page labels of a document with large alphabetical labels.
+
+Patches
+This has been fixed in pypdf==6.19.0.
+
+Workarounds
+If you cannot upgrade yet, consider applying the changes from PR #4096.

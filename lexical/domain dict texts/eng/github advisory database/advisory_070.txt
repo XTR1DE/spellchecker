@@ -1,0 +1,46 @@
+Summary
+Axios request interceptors may return a replacement config object. If an interceptor returns a plain object without an own headers property, dispatchRequest() later evaluates config.headers and can resolve an inherited Object.prototype.headers value. In a process where another vulnerability has polluted Object.prototype.headers, axios can send attacker-controlled headers.
+
+Axios does not create the prototype pollution source, and the interceptor itself is trusted caller code. The vulnerable behavior is the post-interceptor axios config read that reopens a prototype-pollution gadget after earlier null-prototype config hardening.
+
+Impact
+An attacker with a prior same-process prototype-pollution primitive can inject headers into affected axios requests when the application uses an interceptor that rebuilds config and omits headers. Depending on the target service, injected headers can affect cache behavior, conditional requests, metadata services, or application-specific authorization and routing logic.
+
+The issue is conditional and should not be described as affecting every interceptor or every request.
+
+Affected Functionality
+Affected:
+
+Request interceptor chains where an interceptor returns a new ordinary object.
+Replacement config objects that omit an own headers property.
+dispatchRequest() header normalization through AxiosHeaders.from(config.headers).
+Not affected:
+
+Requests whose interceptor preserves an own headers property.
+Interceptors that mutate and return the existing null-prototype config.
+Processes without prototype pollution.
+Technical Details
+lib/core/dispatchRequest.js contains:
+
+config.headers = AxiosHeaders.from(config.headers);
+The initial merged config is null-prototype, but an interceptor can replace it with a normal object. If that object has no own headers, the read can resolve Object.prototype.headers.
+
+Local verification on axios 1.18.1 polluted Object.prototype.headers = { 'X-Poisoned': 'yes' }, installed an interceptor that returned { url, method, timeout, proxy: false }, and sent a request. The loopback server received X-Poisoned: yes.
+
+Proof of Concept of Attack
+Constrained local demonstration:
+
+Object.prototype.headers = { 'X-Poisoned': 'yes' };
+
+const client = axios.create();
+client.interceptors.request.use((config) => ({
+  url: config.url,
+  method: config.method,
+  timeout: config.timeout
+}));
+
+await client.get(url);
+Expected safe behavior is that missing headers normalize to an empty header set. Current affected behavior reads inherited Object.prototype.headers.
+
+Workarounds
+Interceptors that rebuild config should always set an own headers property, for example by preserving config.headers or setting headers: {}. Mutating and returning the existing merged config also avoids replacing the null-prototype object.

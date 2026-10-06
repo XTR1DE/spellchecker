@@ -1,0 +1,41 @@
+Affected: GitPython 3.1.61 (latest release) and main — git/objects/submodule/base.py. git diff 3.1.61 origin/main -- git/objects/submodule/ is empty, so both are identical here.
+
+The gap
+The fix for GHSA-hmq2-w58f-27jc added Submodule._validated_name() and wired it into update() and five siblings, closing the .gitmodules name → .git/modules/<name> traversal. The other attacker-controlled .gitmodules field, path, is read raw:
+
+# git/objects/submodule/base.py:172-177
+def _set_cache_(self, attr):
+    if attr in ("path", "_url", "_branch_path"):
+        reader = self.config_reader()
+        self.path = reader.get("path")          # raw .gitmodules value
+and GitPython's own containment guard is applied in only two of the places that consume it:
+
+400: def _to_relative_path(cls, parent_repo, path)      # the guard (abspath + commonpath containment)
+542:     path = cls._to_relative_path(repo, path)        # add()   — guarded
+1041:    module_checkout_path = self._to_relative_path(self.repo, module_path)   # move() — guarded
+update() validates only the name and then uses the path-derived absolute location directly:
+
+788:  self._validated_name(self.name)                    # NAME only
+801:  checkout_module_abspath = self.abspath             # derived from self.path — unguarded
+821:  os.makedirs(checkout_module_abspath, exist_ok=True)
+So path = ../../../tmp/escaped in an attacker-authored .gitmodules selects the directory that gets created and, on the clone path, populated from the submodule URL. The same absolute location is what force_remove hands to shutil.rmtree.
+
+The asymmetry is the argument: this is not a missing concept — the project wrote _to_relative_path() precisely for this, and add()/move() use it. update() does not.
+
+Honest limits (please read before rating)
+The most common flow is not affected. Repo.clone_from(...) → repo.submodules → sm.update(init=True) re-derives path from a canonical tree lookup, and real git refuses to check out a tree containing a .. component, so an evil .gitmodules never lands in the working tree in the first place. A reachable trigger therefore requires the victim's code to name a non-HEAD commit (a historical-commit API such as submodule_update(previous_commit=...)).
+The researcher did not build that end-to-end trigger. The researcher only verified first-hand the code above: the guard's two call sites, the name-only validation in update(), and the unguarded abspath → os.makedirs() flow at 3.1.61 == main.
+Suggested fix
+Apply the guard the project already has, wherever the path is consumed:
+
+# in update(), before deriving abspath (and in any other consumer of self.path):
+checkout_rel = self._to_relative_path(self.repo, self.path)   # raises if it escapes the working tree
+Better still, validate at the boundary: reject a .gitmodules entry whose path is absolute or contains a .. component when the section is first read in _set_cache_()/iter_items(), so no consumer can be added later without the check. A regression test with path = ../escaped alongside the existing name test would pin both fields.
+
+Prior art checked
+GHSA-hmq2-w58f-27jc (this is a residual of its fix, in the sibling field, not a re-report) plus the repository's 30 published advisories — none mentions the path field or _to_relative_path. Searched issues and PRs for _to_relative_path, gitmodules path and submodule traversal: no report of this.
+
+Credit
+kta1kri.
+
+Appendix — EVIDENCE_gitpython_path_unguarded_20260901.txt (inlined; advisories accept no attachments)

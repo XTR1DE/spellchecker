@@ -1,0 +1,8 @@
+Impact
+An attacker who uses this vulnerability can craft a PDF which leads to large memory consumption. This requires parsing the /ToUnicode entry of a font with unusually large values, for example during text extraction.
+
+Patches
+This has been fixed in pypdf==6.18.1.
+
+Workarounds
+If you cannot upgrade yet, consider applying the changes from PR #4071.

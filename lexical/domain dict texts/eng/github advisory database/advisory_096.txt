@@ -1,0 +1,10 @@
+Impact
+moment before 2.31.0 is vulnerable to path traversal in moment.locale(). When an application passes a non-string, attacker-influenced value to moment.locale(), a specially crafted object can bypass the locale name validation and cause moment to load a file from an attacker-controlled path. This is a further bypass of the validation added in 2.29.2 for CVE-2022-24785.
+
+This affects server-side (npm) users only. Plain string input is not affected: the existing validation correctly rejects strings that contain path separators.
+
+Patches
+This issue is patched in moment 2.31.0.
+
+Workarounds
+Validate that any user-supplied input is a string before passing it to moment.locale().

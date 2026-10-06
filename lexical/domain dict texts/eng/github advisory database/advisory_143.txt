@@ -1,0 +1,42 @@
+Summary
+A timing side-channel vulnerability exists in the PKCE (RFC 7636) implementation
+of the Authorization Code Grant flow. The code_challenge_method_plain function
+uses Python's standard == operator for string comparison instead of a
+constant-time comparison function, potentially allowing timing-based attacks.
+
+Affected Component
+File: oauthlib/oauth2/rfc6749/grant_types/authorization_code.py
+Functions: code_challenge_method_plain, code_challenge_method_s256
+Vulnerability Type: CWE-208 (Observable Timing Discrepancy)
+Technical Details
+Python's == operator uses short-circuit evaluation when comparing strings:
+
+Returns False immediately if lengths differ
+Compares characters left-to-right, stopping at first mismatch
+This means comparison time varies linearly with the length of the common prefix
+between the attacker-supplied verifier and the stored challenge, creating a
+measurable timing oracle.
+
+Proof of Concept
+Tested locally against oauthlib source (network jitter eliminated to isolate
+pure Python execution time):
+
+Input	Result	Time (10M iterations)
+Wrong first char (B + A*49)	Fast reject	0.34106s
+49 chars correct (A*49 + B)	Deep compare	0.37847s
+Difference		0.03741s
+The ~37ms delta over 10M iterations corresponds to nanosecond-level differences
+per call, which are statistically exploitable under controlled conditions.
+
+Attack Scenario
+Attacker intercepts authorization_code via Custom URI Scheme Hijacking
+PKCE blocks token request — attacker lacks code_verifier
+Attacker sends repeated requests to /token endpoint measuring response times
+Using timing oracle, attacker recovers code_verifier character by character
+Attacker obtains Access Token → Account Takeover
+Note: Practical exploitability is limited due to the single-use nature of
+authorization codes and real-world network noise. However, the vulnerable
+pattern should be corrected as a defense-in-depth measure.
+
+Recommended Fix
+Replace == with hmac.compare_digest() for constant-time comparison:

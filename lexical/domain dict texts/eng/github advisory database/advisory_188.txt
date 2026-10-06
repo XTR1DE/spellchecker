@@ -1,0 +1,26 @@
+Impact
+An uncontrolled resource consumption / algorithmic complexity vulnerability affecting any application that parses untrusted email with this library.
+
+Three independent parsing paths are super-linear in cost, so a byte-size cap on the caller side does not bound the work done. A crafted message under 2 MB can consume seconds of CPU or hundreds of megabytes to multiple gigabytes of memory (leading to an out-of-memory kill), enabling denial of service. The parse is lazy, but the cost is paid on the first getAllParts() or content read.
+
+Details
+Deep multipart nesting is O(depth²). MimeParserService::findContentBoundary() tests each content line against the current part and every ancestor via the recursive ParserMimePartProxy::setEndBoundaryFound(), so a nesting depth of D costs 1 + 2 + … + D comparisons. A ~600 KB message nested ~10,000 deep does not finish parsing in a minute.
+Many sibling parts is O(n²). PartChildrenContainer::add() appends each child with array_splice($children, count($children), 0, [$part]), which reindexes the entire array on every call. The same container backs UUEncoded begin parts via NonMimeParserService.
+Header buffering is unbounded. HeaderParserService::parse() reads header lines up to a blank line with no limit on header count or total size, so a few megabytes of header lines can hold hundreds of megabytes resident; a ~5 MB message of headers can reach multiple gigabytes and be OOM-killed.
+
+Run with a raised memory limit so the header case does not abort early:
+
+php -d memory_limit=2048M poc.php
+// nesting depth=2000 input= 0.13 MB time= 2.08 s peak= 30.0 MB
+// siblings=50000 input= 1.72 MB time= 5.11 s peak= 276.0 MB
+// headers=300000 input= 2.29 MB time= 0.40 s peak= 380.3 MB
+
+Patches
+Fixed in 4.0.2 and 3.0.6. The fixes add configurable limits on multipart nesting depth and on header count / total header size (recording a parse error past the threshold rather than throwing), and change sibling append to O(n). Users should upgrade to one of these (or later) versions.
+
+Versions 2.x are also affected but are end-of-life and will not receive patches; users on those lines should upgrade to a fixed release. (Versions prior to 2.0 used a different parser and are not affected by all three paths.)
+
+Workarounds
+These costs are super-linear, so an input byte-size cap alone does not bound them. Until upgrading, restrict exposure of the parser to untrusted input, and run parsing under a constrained memory_limit and execution time limit so a malicious message fails its own request rather than exhausting the host.
+
+Found and reported privately by Ilia Alshanetsky (@iliaal), who also proposed fixes that informed the patches.

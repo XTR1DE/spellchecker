@@ -1,0 +1,8 @@
+Impact
+When using RBAC to apply authentication rules, the exact path (method name) matcher applies a prefix match instead of an exact match for case-insensitive matches. As a result, if a service has a method with a name that is a prefix of the name of a different method, and they have different access rules, and case-insensitive matching is used, this bug can cause improper authentication.
+
+Patches
+This vulnerability is fixed in 1.13.1 and 1.14.1.
+
+Workarounds
+This problem can be avoided by enabling case-sensitive path matching.

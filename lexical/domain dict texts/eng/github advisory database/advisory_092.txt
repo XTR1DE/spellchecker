@@ -1,0 +1,10 @@
+Impact
+fast-uri's mailto scheme parser compares each query field name to the reserved names (to, subject, body) while the name is still percent-encoded, and only percent-decodes it when storing it as a generic header. On serialize, the decoded name is re-emitted, so a field name such as %74o (percent-encoded to) is not recognized as a recipient at parse time (parse().to shows only the legitimate recipient) but materializes as a literal to= field after serialize(), and reparsing then treats it as a recipient. The same technique smuggles subject and body through %73ubject and %62ody.
+
+An application that parses an untrusted mailto URI, makes a display, allowlist, or logging decision on parse().to, then re-serializes the result and passes the serialized string to a mail client or an outbound send path can gain an attacker-chosen recipient, subject, or body that was not visible when the recipient list was checked. A scanner inspecting the raw input for an extra to= sees nothing, because the injected field appears only after fast-uri serializes.
+
+Patches
+Upgrade to fast-uri 4.1.5.
+
+Workarounds
+Percent-decode and compare mailto field names case-insensitively before trusting parse().to, or re-check the recipient list on the serialized output rather than only on the initial parse, until upgrading.

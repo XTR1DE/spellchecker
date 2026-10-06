@@ -1,0 +1,152 @@
+Summary
+A russh server can be driven to unbounded heap growth (process OOM / kill) by
+a peer that speaks only standard SSH messages, in the default configuration.
+
+The peer starts a key re-exchange (sends SSH_MSG_KEXINIT) but never sends the
+follow-up SSH_MSG_KEX_ECDH_INIT, leaving the server's kex state machine in
+SessionKexState::InProgress indefinitely. While a rekey is in progress the
+server's three message-drain paths are all gated off (if !self.kex.active()),
+but the network-read path stays active, so every SSH_MSG_CHANNEL_OPEN the peer
+sends is processed inline and appends one reply to an unbounded internal
+queue (priority_receiver, an UnboundedReceiver) that is not dequeued until
+the rekey completes. Because the peer decides whether the rekey ever completes,
+the queue — and the server's memory — grows without bound.
+
+This is reproducible end-to-end against a real russh server over a real
+encrypted transport; see "Proof of concept". A one-line negative control (same
+flood, no rekey) keeps memory flat, isolating the rekey window as the sole
+trigger.
+
+Impact
+Availability / DoS. Server RSS climbs at roughly 3.3 KB per
+CHANNEL_OPEN, driven entirely by the peer, until the process is OOM-killed.
+In the reproduction one connection pushed the server from ~4 MB to 2.57 GB
+(and past 4.8 GB against the stock echoserver example) and it was still
+climbing when the flood was stopped.
+Reached with standard messages, no special configuration. Any handler is
+affected, including one that rejects every channel (the reply enqueued on
+rejection is exactly what accumulates). There is no per-connection cap on
+in-flight channel opens or on the queue, and the queue's sender has no
+backpressure.
+The peer keeps the connection alive simply by continuing to send, so the
+inactivity timer never fires.
+Affected component
+russh/src/server/session.rs — Session::run tokio::select! loop. The
+network-read arm is ungated; the three drain paths are gated on
+!self.kex.active().
+russh/src/server/mod.rs — reply() routes a non-kex message received during
+a rekey straight to server_read_encrypted (inline processing).
+russh/src/lib_inner.rs — ChannelOpenHandleInner's accept/reject/Drop
+all send a reply on an UnboundedSender.
+Verified on v0.63.1 (commit d3ae702), which is the latest release. The
+gating logic predates it.
+
+Details
+Session::run (russh/src/server/session.rs:631) drives a tokio::select!
+(:713). Three of its message-drain sites are gated on !self.kex.active():
+
+the pre-select! batch drain of priority_receiver/receiver
+(session.rs:680),
+the priority_receiver.recv() arm (session.rs:762),
+the receiver.recv() arm (session.rs:770, which also holds the only other
+priority_receiver drain at :777).
+The fourth arm, r = &mut reading (session.rs:714), is ungated: it reads
+and processes one incoming packet every loop iteration regardless of rekey
+state, calling reply() (server/mod.rs:1128).
+
+During a rekey, session.common.encrypted.is_some(), so the strict-kex
+message-ordering guard (server/mod.rs:1143, which is additionally gated on
+encrypted.is_none()) does not apply. A non-kex message therefore falls
+through reply() to session.server_read_encrypted(handler, pkt)
+(server/mod.rs:1232) and is handled inline. For SSH_MSG_CHANNEL_OPEN this
+reaches the channel-open handling, which hands the application a
+ChannelOpenHandle.
+
+Whether the handler accepts or (the trait default) rejects, the handle's
+accept / reject / Drop all send a Msg::ChannelOpenReply on an
+UnboundedSender (russh/src/lib_inner.rs:560-603; Drop sends
+AdministrativelyProhibited at :594-603). That sender feeds
+priority_receiver, declared UnboundedReceiver<Msg> (session.rs:23) and
+created with tokio::sync::mpsc::unbounded_channel() (session.rs:1522). Its
+only drain sites are the three arms gated off during the rekey. So each
+CHANNEL_OPEN processed during the rekey window appends one reply (carrying a
+PendingChannelOpen = channel params + mpsc ChannelRef + ids, a few KB
+retained in practice) to a queue that is never dequeued.
+
+Two facts make this unbounded and remote:
+
+The server enters InProgress the moment it receives the peer's KEXINIT
+(server/mod.rs:1153-1158, begin_rekey) and only leaves it upon receiving
+the peer's KEX_ECDH_INIT. The peer decides whether to ever send that,
+so the window is attacker-held.
+There is no per-connection cap on channels or on the priority queue, and the
+sender is unbounded (no backpressure).
+Root cause
+The intended design was to buffer packets received during a rekey and replay
+them afterwards: the fields pending_reads: Vec<Vec<u8>> and pending_len: u32
+(session.rs:26-27) exist and are drained at kex completion
+(server/mod.rs:1194-1198). But nothing ever pushes to pending_reads or
+increments pending_len (they are dead — confirmed by grep across
+russh/src/). Instead of being buffered, channel messages received during a
+rekey are processed inline, and their replies pile up in the unbounded
+priority_receiver. The missing piece is a bound on — or bounded deferral of —
+channel processing while kex.active().
+
+Proof of concept
+Everything runs inside a container; nothing touches the host.
+
+Lab. poc/Dockerfile builds russh-lab:head from Eugeny/russh @ d3ae702
+(v0.63.1), default features (rust 1.91). A raw-SSH-client PoC
+(poc/poc_rekey_dos.rs) implements curve25519-sha256 / ssh-ed25519 /
+aes256-ctr / hmac-sha2-256 by hand, completes the handshake and a publickey
+auth, then:
+
+sends SSH_MSG_KEXINIT (server enters kex.active()),
+never sends KEX_ECDH_INIT (rekey stalls, attacker-held),
+floods SSH_MSG_CHANNEL_OPEN.
+A minimal server (poc/poc_server.rs) uses the trait-default
+channel_open_session (which rejects by dropping the handle), so the measured
+growth is purely the undrained priority queue, not accepted-channel state.
+
+poc/run.sh runs the attack leg and an identical negative control with no
+rekey. Fresh run inside the lab, N = 800,000 opens
+(results/rerun-2026-08-29.log):
+
+=== ATTACK (rekey stall) === (poc_server baseline_RSS=4208KB, N=800000)
+  t=2s  server_RSS=667760KB
+  t=4s  server_RSS=1599600KB
+  t=6s  server_RSS=2556016KB
+  t=8s  server_RSS=2566256KB   (flood done; memory retained)
+=== CONTROL (no rekey) === (poc_server baseline_RSS=4208KB, N=800000)
+  t=2s..t=12s  server_RSS=4208KB   (flat throughout)
+ATTACK: RSS 4,208 KB → 2,566,256 KB (~2.57 GB) and retained after the
+flood ends — ~3.3 KB per CHANNEL_OPEN, attacker-driven. (An earlier canonical
+run reached 2.7 GB at 800k opens, and past 4.8 GB against the stock
+echoserver example at 1.5 M opens — see results/canonical-run.log.)
+CONTROL: RSS flat at 4,208 KB. Without the rekey window the replies are
+drained normally; TCP backpressure (the client never reads the failure
+replies) even throttles the flood.
+The control isolates the rekey window as the sole trigger. Both legs exercise
+the real server entry point (Session::run → reply → server_read_encrypted)
+over a real encrypted transport.
+
+Reproduce: C=russh-lab N=800000 ./poc/run.sh (see poc/POC-README.md).
+
+Remediation
+The priority queue carries locally generated channel-open replies, which are
+non-kex messages the server must not send during a rekey anyway (RFC 4253
+§7.1). So the fix is to bound how much channel work is done during a rekey, not
+to drain the queue mid-rekey. Any of:
+
+(recommended, minimal) cap the number of non-kex messages processed while a
+rekey is in progress and disconnect a peer that exceeds it. A stalled/abusive
+rekey is then torn down after a small constant instead of growing memory
+without bound. See patch/rekey-message-cap.patch (a ~10-line change local to
+Session::run, validated in the lab — the attack leg is disconnected after the
+cap and RSS stays flat; a normal rekey, which completes in one round trip, is
+unaffected).
+bound / deferred-buffer channel messages during a rekey using the existing
+(currently dead) pending_reads/pending_len machinery, with a hard cap.
+bound the number of in-flight channel opens per connection and reject beyond it.
+OpenSSH does not service new channels mid-kex; matching that intent closes the
+whole family.

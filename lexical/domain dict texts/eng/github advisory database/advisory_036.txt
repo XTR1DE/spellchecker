@@ -1,0 +1,21 @@
+Summary
+pyvenv.cfg is a line-based format with no escape syntax. PyEnvCfg.write() wrote values verbatim, while PyEnvCfg._read_values() parses the file with str.splitlines(). A value containing a line boundary therefore became additional configuration lines, and because reading is last-wins, the injected keys replaced any key written earlier in the file.
+
+Impact
+The prompt value is the reachable input: it is set by --prompt, by the VIRTUALENV_PROMPT environment variable, or from the config file, and write() emits prompt before home. A crafted prompt can therefore set home in the generated pyvenv.cfg:
+
+$ virtualenv --prompt $'x"\nhome = /attacker/path\nprompt = "z' venv
+$ grep '^home' venv/pyvenv.cfg
+home = /attacker/path
+home is what tooling reads to locate the base interpreter, so a consumer that trusts it can be pointed elsewhere. implementation, version_info, version, executable, command and virtualenv are also written before prompt and can be replaced the same way.
+
+This requires the prompt to come from somewhere other than the person running the command, for example a CI job templating a branch name into it, tooling deriving an environment name from user-supplied data, or an inherited VIRTUALENV_PROMPT. Where the operator supplies the prompt directly they already control the command line, and the effect is corruption rather than privilege gain: the value is truncated at the boundary and read back with a dangling quote.
+
+Details
+The boundary set is the one str.splitlines() recognizes, which is wider than \n: \r, \v, \f, the file, group and record separators, U+0085, U+2028 and U+2029 were all written through unchanged and all split the line when read back.
+
+Patches
+PyEnvCfg.write() now collapses those boundaries to spaces as it serializes each line, so it cannot emit a structurally invalid file regardless of what a caller places in content.
+
+Workarounds
+Do not pass externally influenced data as the virtualenv prompt. Strip line boundaries from any value before using it as --prompt or VIRTUALENV_PROMPT.

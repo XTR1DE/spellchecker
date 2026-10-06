@@ -1,0 +1,7 @@
+fast-uri accepts a host that contains an unbalanced or misplaced authority bracket ([ or ]) without reporting an error. A host that starts with [ but does not end with ], such as [@127.0.0.1, is neither validated as an IP literal nor canonicalized as a domain name, so parse() returns it as the host with error undefined, while Node's URL (and http.get, axios, got, and other clients built on it) resolve the same string to 127.0.0.1. An application that reads parse().host to make a host decision (an SSRF denylist, a redirect allowlist, or proxy routing) and then passes the original URL to an HTTP client evaluates its policy against a string that is not the host the request reaches. The same host is carried through normalize(), equal(), and resolve().
+
+Patches
+This vulnerability has been patched in fast-uri 4.1.4, 3.1.7, and 2.4.6. parse() now reports URI host is malformed. for any host that contains a bracket but is not a valid [IPv6] literal. All users should upgrade.
+
+Workarounds
+If upgrading is not immediately possible, reject any URL whose host contains a [ or ] that is not a well-formed IPv6 literal before making a host decision. Clients that fail closed on credential-bearing URLs, such as Node's global fetch(), are not affected by the reported vector.

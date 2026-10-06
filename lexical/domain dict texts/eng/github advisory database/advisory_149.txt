@@ -1,0 +1,8 @@
+Impact
+Morgan writes attacker-controlled request data to the access log. Its escaping (added in 1.11.0 and 1.12.0) neutralizes control characters, the Unicode line separators, and backslash, but not the double quote (0x22), which is the field delimiter of the Apache combined log format morgan emits. An attacker who controls a quoted field (:user-agent, :referrer, the request URL, or the Basic auth :remote-user) can inject a double quote to close the field early and forge additional fields in the log record. The combined, common, and default formats, and any custom format that quotes a token, are affected. This is an incomplete fix of CVE-2026-5078 and CVE-2026-15603.
+
+Patches
+Users should upgrade to version 1.12.1.
+
+Workarounds
+Update to version 1.12.1.

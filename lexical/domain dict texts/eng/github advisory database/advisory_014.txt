@@ -1,0 +1,53 @@
+Description
+A language pack ships a Plural-Forms header saying how the language counts, for example nplurals=2; plural=(n != 1);. JupyterLab turns that string into a function with new Function, so the header gets executed. The check that meant to keep it safe was a regular expression. The regex was anchored at the start but not at the end, so it accepted any string that began with a valid plural rule and ignored everything after it.
+
+A header such as the following passed the check, and the part after the plural rule ran in the JupyterLab page as soon as the first plural string was translated:
+
+nplurals=2; plural=(n > 1); <anything here ran as JavaScript>
+Users are affected if all of the following are true:
+
+they run JupyterLab 3.0.0 through 4.6.3, or an application that bundles it such as Notebook 7;
+a language pack they did not write is installed in the environment; and
+that language is selected, so its catalogue is loaded
+An installation using the default English locale loads no catalogue and is not affected.
+
+CVE assignment pending, GitHub CNA is experiencing severe backlog
+
+Impact
+The code in the header ran in the JupyterLab page, in the same origin and session as the authenticated user. It could call the Jupyter Server REST API as that user: read and write any file under the server root, start a kernel and run code in it, and open a terminal where terminals are enabled. Nothing had to be clicked; translating one plural string was enough, and that happens during normal use of the interface.
+
+What this changes is who has to be trusted. A language pack is a Python package, and installing one is already a privileged act, so an attacker who can get any package installed has server-side code execution regardless of this issue. The header is different because it is catalogue metadata: it travels with translation content, through the translation pipeline that carries strings from Crowdin into the language packs, and it is reviewed as text rather than as code. Anyone able to change a catalogue, or to publish a pack under a name someone installs, got JavaScript execution in every browser that selected that language.
+
+Note: the impact is much more limited on JupyterLite which typically does not have access to most of the surfaces that this flaw exposes.
+
+Patches
+JupyterLab v4.6.4 and v4.5.11 contain the patch. The check now has to match the whole header, so a plural rule followed by anything else is rejected and no function is built from it.
+
+JupyterLab 3.x reached end of life and receives no patch. Its users should move to a supported 4.x release.
+
+Users of applications that depend on JupyterLab, such as Notebook v7+, should update jupyterlab package too.
+
+Workarounds
+Use the English locale, which loads no catalogue:
+
+jupyter lab --LabApp.default_locale=en
+or the following traitlet:
+
+c.LabApp.default_locale = 'en'
+Everyone then sees the interface in English, whatever language they had selected.
+
+To check what is installed instead of switching, report any pack whose header carries more than a plural rule:
+
+python -c "
+import re
+from jupyterlab_server.translation_utils import get_language_packs, get_language_pack
+ok = re.compile(r'\s*nplurals\s*=\s*\d+\s*;\s*plural\s*=[\s\-?|&=!<>+*/%:;n0-9_()]+')
+packs, _ = get_language_packs()
+for locale in packs:
+    data, _ = get_language_pack(locale)
+    for domain, catalog in (data or {}).items():
+        header = catalog.get('', {}).get('plural_forms')
+        if header and not ok.fullmatch(header):
+            print('SUSPECT', locale, domain, repr(header))
+"
+The command prints nothing when every catalogue is sound. A line of output names the pack to remove.

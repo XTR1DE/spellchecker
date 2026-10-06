@@ -1,0 +1,44 @@
+Summary
+An XSS vulnerability exists in @angular/platform-server during server-side rendering (SSR) HTML serialization of ProcessingInstruction DOM nodes (<?target data?>, nodeType === 7) when nested inside fallback raw-content elements (<noscript>, <iframe>, <noembed>, <noframes>). While processing instruction data escaped > to &gt;, it did not check for or escape matching closing tags of ancestor fallback elements (e.g., </noscript>). When rendered in a browser with scripting enabled, an unescaped closing tag sequence in a processing instruction prematurely closes the fallback raw-content tag and causes subsequent sibling elements to execute as live HTML.
+
+Technical Description
+In HTML5 parsing, fallback raw-content elements (<noscript>, <iframe>, <noembed>, <noframes>) place the browser's HTML tokenizer into RAWTEXT mode. In RAWTEXT mode, processing instruction tokens (<?...?>) are treated as literal raw text rather than bogus comments, and the parser ignores > or ?>. The only token sequence that terminates the container is an end tag matching the container tag name (</noscript, </iframe, etc.).
+
+During server-side HTML serialization, processing instruction nodes previously only replaced > with &gt; (preventing bogus comment breakouts in normal HTML data states) but left < untouched. Crucially, processing instruction serialization never inspected ancestor fallback raw-content tags. As a result, if a ProcessingInstruction node inside <noscript> contained </noscript  in its data payload, it was emitted unescaped as <?x </noscript ?>.
+
+Impact & Reachability
+Reachability: Processing instruction nodes cannot be authored directly through standard Angular template syntax (which parses <?...> into comment nodes in DOM position). Reaching this vulnerability requires application or library code calling inject(DOCUMENT).createProcessingInstruction(target, data) or Renderer2 DOM insertion methods with untrusted user input passed to data inside a fallback raw-content container.
+Impact: In applications that programmatically construct processing instruction nodes inside fallback elements during server-side rendering, an attacker controlling the processing instruction data can break out of the container and execute arbitrary JavaScript in victims' browsers.
+Proof of Concept (Minimal Reproduction)
+import { Component, ElementRef, Renderer2, inject, DOCUMENT, AfterViewInit } from '@angular/core';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  template: `<noscript id="host"></noscript>`
+})
+export class AppComponent implements AfterViewInit {
+  private r = inject(Renderer2);
+  private el = inject(ElementRef);
+  private doc = inject(DOCUMENT);
+
+  ngAfterViewInit() {
+    const host = this.el.nativeElement.querySelector('#host');
+    
+    // Attacker-controlled input passed as Processing Instruction data
+    const pi = this.doc.createProcessingInstruction('x', '</noscript ');
+    this.r.appendChild(host, pi);
+    
+    // Sibling markup that should remain inert inside <noscript>
+    const img = this.r.createElement('img');
+    this.r.setAttribute(img, 'src', 'x');
+    this.r.setAttribute(img, 'onerror', 'alert("SSR_PI_XSS")');
+    this.r.appendChild(host, img);
+  }
+}
+Vulnerable SSR Output:
+
+<noscript><?x </noscript ?><img src="x" onerror="alert('SSR_PI_XSS')"></noscript>
+Workarounds
+Avoid passing untrusted user input into document.createProcessingInstruction(target, data) when the node is inserted into <noscript>, <iframe>, <noembed>, or <noframes> during server-side rendering.
+Manually sanitize or replace < with &lt; in any untrusted data passed to processing instruction nodes on the server.

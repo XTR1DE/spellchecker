@@ -1,0 +1,30 @@
+Impact
+An argument-injection vulnerability exists in the CliInvoke
+package's runner factory: RunnerProcessFactory on the 2.x line and
+RunnerConfigurationFactory on the 3.x line.
+
+The factory joins the runner arguments, the caller's target, and the
+caller's arguments into a single ProcessStartInfo.Arguments string and
+hands it to the OS. The OS command-line parser re-tokenizes the string
+before the runner sees it. A double quote (") in the target or in any
+argument closes the OS-level quoted region and lets the next character
+enter argv as a separate element.
+
+Patches
+Upgrade to:
+
+2.8.5 (2.8.x line)
+2.9.4 (2.9.x line)
+2.10.5 (2.10.x line)
+3.0.0-beta.2 (3.x pre-release line)
+Workarounds
+No complete workaround is available. Until you can upgrade:
+
+Strip " from any target or argument before passing it to the
+factory. On shell runners, also strip ;, |, &, $, backtick,
+and parentheses.
+Or bypass the factory entirely and build the ProcessConfiguration
+directly. Set ArgumentList explicitly to the argv you want the
+runner to receive.
+These are partial mitigations. They shift the quoting problem to your
+code.

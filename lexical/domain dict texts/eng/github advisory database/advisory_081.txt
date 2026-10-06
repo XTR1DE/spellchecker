@@ -1,0 +1,35 @@
+Summary
+Axios versions with Node.js HTTP/2 support can terminate the caller’s process when a ClientHttp2Session emits an error event that is not handled by axios.
+
+This affects applications that use the Node HTTP adapter with httpVersion: 2. A malicious, unavailable, or non-HTTP/2 endpoint can cause an uncaught exception instead of a normal rejected axios request.
+
+Impact
+The impact is denial of service. In affected applications, an attacker who can influence the request destination, or operate the destination server, may be able to crash the Node.js process.
+
+This does not affect default HTTP/1.1 usage, browser XHR/fetch adapters, or applications that do not enable axios HTTP/2 support.
+
+Affected Functionality
+Affected path:
+
+Node.js HTTP adapter
+httpVersion: 2
+HTTP/2 session creation/reuse through Http2Sessions
+Network/session failures emitted as ClientHttp2Session error events
+Caller-controlled http2Options can make the issue easier to trigger, but passing arbitrary attacker input into axios config is caller-controlled behavior and should not be the primary advisory framing.
+
+Technical Details
+Http2Sessions.getSession() creates a session with http2.connect(authority, options) but only registers a close handler. It does not register an error handler on the returned ClientHttp2Session.
+
+When the session emits error, Node treats it as an unhandled EventEmitter error and throws. This can bypass the normal axios Promise rejection path and terminate the process.
+
+Proof of Concept of Attack
+import axios from './index.js';
+
+await axios.get('http://127.0.0.1:1/', {
+  httpVersion: 2,
+  timeout: 1000
+});
+Expected vulnerable behavior: the process exits with an uncaught ECONNREFUSED session error instead of only rejecting the axios request.
+
+Workarounds
+Disable axios HTTP/2 for untrusted or user-influenced destinations and use the default HTTP/1.1 adapter until a fixed release is available. Also avoid passing attacker-controlled values into http2Options; axios config is trusted application input.

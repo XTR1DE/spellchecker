@@ -1,0 +1,58 @@
+Vulnerability
+The hybrid ML-KEM 768 + X25519 key exchange implementation in russh/src/kex/hybrid_mlkem.rs does not validate that the remote peer's X25519 public key is not the zero point (all-zero 32-byte value). This allows a remote peer to force the X25519 contribution to the combined shared secret to zero, reducing the hybrid KEX to a single-algorithm exchange.
+
+Affected code at HEAD (v0.62.4, commit 0089c89):
+
+Server-side (server_dh, lines 92-93):
+
+let mut c_pk1 = MontgomeryPoint([0; 32]);
+c_pk1.0.copy_from_slice(c_pk1_bytes);
+// No zero-point check - proceeds to: let k_cl = s_secret * c_pk1;
+Client-side (compute_shared_secret, lines 154-155):
+
+let mut s_pk1 = MontgomeryPoint([0; 32]);
+s_pk1.0.copy_from_slice(s_pk1_bytes);
+// No zero-point check - proceeds to: let k_cl = x25519_secret * s_pk1;
+Root Cause
+Commit a7fc1eb (2026-07-22, "fix mpint encoding and validate curve25519 keys") added zero-point validation to the standalone Curve25519 KEX in russh/src/kex/curve25519.rs at two locations:
+
+server_dh line 77: if client_pubkey.0 == [0u8; 32] { return Err(crate::Error::Kex); }
+compute_shared_secret line 122: if remote_pubkey.0 == [0u8; 32] { return Err(crate::Error::Kex); }
+The same X25519 scalar multiplication pattern appears in hybrid_mlkem.rs, but the fix was not applied there.
+
+Proof of Concept
+A malicious SSH client negotiating mlkem768x25519-sha256 can send a KEX_HYBRID_INIT message containing a valid ML-KEM 768 encapsulation key followed by 32 zero bytes as the X25519 component.
+
+When the server computes k_cl = s_secret * c_pk1, the result is the zero point regardless of the server's secret scalar. The combined shared secret K = SHA-256(k_pq || k_cl) then depends only on the ML-KEM component. The same attack works in reverse against a client connecting to a malicious server.
+
+The zero X25519 public key passes all existing validation (the length check on line 78 succeeds since 32 bytes is correct). No panic or crash occurs - the exchange completes successfully with a weakened shared secret.
+
+Impact
+The purpose of hybrid key exchange is defense-in-depth: if either the classical algorithm (X25519) or the post-quantum algorithm (ML-KEM 768) is broken, the combined secret remains secure. By injecting a zero X25519 public key, an attacker eliminates the classical contribution entirely, reducing security to depend solely on ML-KEM.
+
+This matters in two scenarios:
+
+If ML-KEM 768 is later found to have a weakness (the explicit threat model hybrid KEX is designed to mitigate), sessions where the X25519 component was zeroed out lose their fallback protection.
+An active network attacker who can intercept KEX could downgrade the hybrid exchange to effectively single-algorithm security without either peer detecting it.
+The severity is MEDIUM rather than HIGH because the ML-KEM component still provides strong security today, and an active attacker who can modify KEX messages can already perform other attacks unless strict KEX is negotiated.
+
+Suggested Fix
+Add zero-point checks in hybrid_mlkem.rs matching the ones in curve25519.rs:
+
+// In server_dh, after line 93:
+let mut c_pk1 = MontgomeryPoint([0; 32]);
+c_pk1.0.copy_from_slice(c_pk1_bytes);
+if c_pk1.0 == [0u8; 32] {
+    return Err(Error::Kex);
+}
+
+// In compute_shared_secret, after line 155:
+let mut s_pk1 = MontgomeryPoint([0; 32]);
+s_pk1.0.copy_from_slice(s_pk1_bytes);
+if s_pk1.0 == [0u8; 32] {
+    return Err(Error::Kex);
+}
+Ideally, also validate against the other small-subgroup points on Curve25519 (there are a small number of low-order points that also yield a zero shared secret), matching the comprehensive validation OpenSSH performs.
+
+AI tooling
+AI assistancewas used for the code audit and for drafting this report. The finding was manually verified against the project's source at the location cited above before reporting it, and the severity and impact assessment are my own.

@@ -1,0 +1,49 @@
+Summary
+parseCommaParts() can exhaust the native stack and crash the process. There are two distinct ways to trigger it, both reachable from a single untrusted pattern string.
+
+This is the parsing-side counterpart to CVE-2026-14257 / GHSA-mh99-v99m-4gvg. That fix made expand_() iterative and documented a constant-stack-depth guarantee, but parseCommaParts() was left recursive, so the guarantee only held for one of the two parsing paths.
+
+Vector 1 - unbounded recursion on post
+parseCommaParts() recursed on the remainder of the string once per brace group:
+
+const postParts = parseCommaParts(post)   // unbounded
+A brace group containing many comma-separated groups drives one recursion level per group:
+
+expand('{' + '{a},'.repeat(7000) + 'b}')
+// RangeError: Maximum call stack size exceeded
+About 7,300 repetitions - roughly 29 KB of input - is enough on Node 24; roughly 6,300 (25 KB) on Node 18. The threshold is identical on every affected release line.
+
+Vector 2 - push.apply with an unbounded array
+Even with the recursion removed, parseCommaParts() spread whole arrays into an argument list:
+
+p.push.apply(p, postParts)
+parts.push.apply(parts, p)
+Function.prototype.apply places one argument per element on the stack, so a single large array overflows it. This needs no recursion depth at all - the following reaches a recursion depth of exactly 1:
+
+expand('{{x},' + 'a,'.repeat(125000) + 'b}')
+// RangeError: Maximum call stack size exceeded
+Threshold is about 124,300 repetitions (~249 KB). This vector was not part of the original report; it was found while verifying the fix. A patch that only de-recurses but keeps push.apply leaves a working denial of service behind.
+
+Why max and maxLength do not help
+Both crashes happen during parsing, before any expansion. The payloads produce one result per group, so output size grows linearly with input and is never the limiter. expand(payload, { max: 1, maxLength: 1 }) still overflows.
+
+Impact
+Any application that passes an untrusted string to expand() - directly, or through minimatch / glob where it is a user-supplied glob pattern - can be crashed. In Node, a RangeError that the application does not catch terminates the process, so a server that globs user input is exposed to remote unauthenticated denial of service.
+
+minimatch's own MAX_PATTERN_LENGTH cap (65,536) does not help against vector 1: the overflow threshold sits well below it. Confirmed on minimatch 10.2.6 - a 64,003-byte pattern passes the length check and overflows both minimatch.braceExpand() and new minimatch.Minimatch().
+
+This is an availability-only issue. No code execution and no data exposure.
+
+Not a regression
+5.0.8 and 5.0.9 overflow at the same repetition count, so the gap predates the recent advisories; those fixes simply did not reach it. Verified affected on 1.1.18, 2.1.4, 3.0.6, 5.0.8 and 5.0.9, all at an identical threshold.
+
+Patch
+parseCommaParts() is rewritten as a loop that carries the partial part across chunks, and every array append uses an element-by-element loop rather than push.apply. The redundant if (!str) return [''] guard is dropped - the loop returns [''] for the empty string on its own.
+
+Equivalence of the old and new implementations was checked by differential testing: exhaustive over every string of {, }, ,, a up to length 7 plus 300,000 random inputs - 322,000 cases, zero mismatches.
+
+Severity note
+Scored 7.5 High under CVSS 3.1 for consistency with the other availability advisories on this package (GHSA-mh99-v99m-4gvg, GHSA-rgw5-rvv9-x895), which use the same vector. The reporter self-assessed 6.9 Medium under CVSS 4.0 (CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:L/SC:N/SI:N/SA:N).
+
+Credit
+Reported by baeseungwon1010, with a working proof of concept and a proposed patch. Vector 2 was identified during maintainer verification.

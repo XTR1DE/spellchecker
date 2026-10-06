@@ -1,0 +1,12 @@
+Impact
+stringify and uneval serialize a typed array by emitting its backing ArrayBuffer, not just the view. In the case of a Node Buffer object, the backing buffer is a process-wide shared pool, meaning unrelated memory can be serialized into a response that is then sent to the client. For a Node Buffer the backing store is Node's process-wide shared pool, so serializing a small Buffer copies up to 64 KB of unrelated process memory — including bytes from other in-flight requests — into the output. In an SSR framework (SvelteKit, Nuxt) a public page whose load() returns a 2-byte Buffer, or a small file read with readFileSync, ships another user's request body / Authorization header in its HTML. Unauthenticated, silent, ~43,000× amplification.
+
+This is serialization-side, so the parse/unflatten prototype-pollution and DoS guards do not apply — it fires on every SSR render, not only when parsing untrusted input.
+
+Workarounds
+Convert Node Buffer objects to Uint8Array:
+
+payload = {
+- buffer
++ buffer: new Uint8Array(buffer)
+}

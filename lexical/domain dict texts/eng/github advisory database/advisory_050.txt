@@ -1,0 +1,21 @@
+Summary
+The @astrojs/netlify adapter generated regular expressions for Netlify Image CDN remote-image allowlists without anchoring them to the beginning of the URL. Netlify evaluates these expressions with RegExp.test(), so an allowed image origin appearing anywhere in a URL, including its path or query string, could satisfy the allowlist.
+
+For example, an application allowing images.example.com could accept a source URL such as:
+
+http://127.0.0.1:6379/?url=https://images.example.com/image.png
+The allowlist matched the approved origin in the query string, but Netlify parsed and fetched the URL whose actual host was 127.0.0.1.
+
+Impact
+An unauthenticated attacker can bypass the configured image.domains or image.remotePatterns allowlist through the public /.netlify/images endpoint and cause Netlify Image CDN to make requests to attacker-selected URLs. This may allow probing or reaching internal services, depending on Netlify's network-level egress protections.
+
+The Image CDN attempts to transform responses as images, which limits direct response exfiltration. No confidentiality or integrity impact has been demonstrated.
+
+Affected versions
+@astrojs/netlify versions from 5.2.0 through 8.2.3.
+
+Patches
+Fixed in @astrojs/netlify 8.2.4. Generated remote-image allowlist expressions are now anchored to both the beginning and end of the source URL.
+
+Workarounds
+Upgrade to @astrojs/netlify 8.2.4 or later. Before upgrading, disable Netlify Image CDN by setting imageCDN: false in the adapter configuration, or remove remote image allowlist entries.

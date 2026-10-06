@@ -1,0 +1,22 @@
+http4s-scala-xml provides EntityDecoder[F, scala.xml.Elem] instances that parse XML message bodies. These decoders used a javax.xml.parsers.SAXParserFactory obtained from SAXParserFactory.newInstance without any security configuration. With the JDK's default settings, the parser resolves DOCTYPE declarations, external general and parameter entities, and external DTDs.
+
+An application that uses these decoders to parse untrusted XML is vulnerable to XML External Entity (XXE) attacks. An attacker can craft a request that:
+
+discloses local files readable by the service process,
+performs server-side request forgery (SSRF) against internal network resources, and/or
+causes denial of service through entity expansion.
+Impact
+Any service that derives an XML EntityDecoder from this library and parses attacker-controlled input is affected.
+
+Patches
+The default SAXParserFactory is now hardened:
+
+secure processing is enabled
+DOCTYPE declarations are disallowed
+external general/parameter entities and external DTD loading are disabled
+DTD URIs are not resolved
+XInclude is disabled.
+These defaults match scala.xml.XMLLoader's defaults since 2.0.0.
+
+Workarounds
+Before upgrading, override ElemInstances#saxFactory with a hardened factory.

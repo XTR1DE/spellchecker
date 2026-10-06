@@ -1,0 +1,4 @@
+Description
+Evaluating legitimate uneval output for a sparse array can allocate memory proportional to its declared length. A tiny serialized value can therefore cause large memory allocation in a consuming browser/runtime. This occurs during evaluation of generated code, not in default parse sparse-array construction.
+
+You would only be affected by this if you were serializing very large sparse arrays and then evaluating the results. In the general use case for uneval of sending data to the client, the worst that could happen is the browser tab running out of memory.

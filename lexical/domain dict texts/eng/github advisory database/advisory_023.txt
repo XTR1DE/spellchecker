@@ -1,0 +1,3 @@
+When serializing multiple promises, a later promise can reject before an earlier one settles. An internal rejected promise remains unhandled even if the caller catches the returned stringifyAsync promise. Under Node's default unhandled-rejection behavior this can terminate the process. Applications whose asynchronous failures/timing can be influenced by requests are potentially exposed.
+
+This is essentially impossible to exploit, and is much more likely to surface as a developer-introduced bug.

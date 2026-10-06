@@ -1,0 +1,84 @@
+Summary
+HTTPServerRequest.__init__ in tornado/httputil.py parses the URL query string via
+parse_qs_bytes() with no field-count limit — while the sibling POST-body parsing path
+(parse_body_arguments) received a max_num_fields=1000 cap added earlier in this exact
+same release (v6.5.8, commit 8d6363ed), explicitly to bound parsing cost for the identical
+underlying primitive. This leaves the query-string path with the resource-exhaustion exposure
+the body-path fix was meant to close.
+
+File: tornado/httputil.py, line 553 (HTTPServerRequest.__init__)
+
+Root Cause
+# tornado/httputil.py:553 (before fix)
+self.arguments = parse_qs_bytes(self.query, keep_blank_values=True)
+Compare with the POST-body path fixed one commit earlier in the same release:
+
+# tornado/httputil.py:1038-1041
+uri_arguments = parse_qs_bytes(
+    body,
+    keep_blank_values=True,
+    max_num_fields=config.urlencoded.max_arguments,  # default 1000
+)
+Both call sites funnel through the same tornado.escape.parse_qs_bytes (a thin wrapper over
+urllib.parse.parse_qs), which is exactly why max_num_fields was added to
+urllib.parse.parse_qsl upstream — to let frameworks bound field count. The fix was applied
+only to the body path; the query-string path was missed.
+
+The request line + headers together are capped at max_header_size (default 65536 bytes), so
+this is not literally unbounded, but a single ~64KB request line can carry thousands of short
+key=value pairs — far beyond the 1000-field limit the maintainer judged appropriate for the
+structurally identical body case.
+
+Attack Scenario
+Attacker sends a GET request whose query string is packed with thousands of short fields
+(e.g. k0=1&k1=1&...&k7799=1, ~61KB), fitting comfortably under max_header_size. No
+authentication, cookies, or prior state required.
+Tornado accepts and parses this with no field-count cap, unlike the equivalent POST-body
+request (which is correctly rejected with 400 once >1000 fields are present).
+Parsing thousands of fields is CPU work performed synchronously inside Tornado's
+single-threaded IOLoop. Several such requests in flight concurrently stall the event
+loop, delaying processing of all other connections on that loop — not just the
+attacker's own request.
+Verification (dynamic, local reproduction against v6.5.8)
+Ran the unmodified v6.5.8 source directly (no external dependencies needed) with a minimal
+tornado.web.Application on 127.0.0.1:8888.
+
+Identical 7800-field/~61KB payload sent as GET query string → 200 OK; sent as POST body
+(application/x-www-form-urlencoded) → 400 Bad Request (correctly rejected by the
+existing max_num_fields body-path limit). This confirms the asymmetry directly.
+Per-request parse cost: baseline (/?a=1) averaged 1.86ms; the 7800-field query string
+averaged 25.1ms (~13x).
+Event-loop-blocking amplification (raw-socket test, isolating server-side stall from
+client overhead): with 10 sequential baseline probe requests fired with no load, average
+latency was 1.47ms (max 5.9ms). With 5 concurrent 61KB/7800-field requests in flight,
+the same baseline probes averaged 13.0ms (max 118.1ms) — an 8.9x average slowdown for
+unrelated clients, produced by ~305KB of unauthenticated attacker traffic.
+Impact
+All Tornado servers/applications are affected — this triggers on every request with a query
+string, independent of application/handler logic. An unauthenticated, unprivileged remote
+attacker can measurably degrade response times for all other clients sharing the same
+IOLoop, using a small amount of bandwidth and no special conditions. This is an
+availability/DoS concern; no confidentiality or integrity impact.
+
+Recommended Fix
+# tornado/httputil.py — HTTPServerRequest.__init__
+if uri is not None:
+    self.path, sep, self.query = uri.partition("?")
+try:
+    self.arguments = parse_qs_bytes(
+        self.query,
+        keep_blank_values=True,
+        max_num_fields=_DEFAULT_PARSE_BODY_CONFIG.urlencoded.max_arguments,
+    )
+except ValueError as e:
+    raise HTTPInputError("Invalid query string: %s" % e) from e
+This reuses the existing ParseUrlEncodedConfig.max_arguments default (1000) via the
+module's _DEFAULT_PARSE_BODY_CONFIG, matching the POST-body limit and honoring any global
+override via set_parse_body_config(). The try/except is necessary because — unlike
+parse_body_arguments, which already wraps its call and converts ValueError into a clean
+HTTPInputError/400 — the query-string call site currently has no such handling, so without
+it, a request exceeding the limit would raise an uncaught ValueError instead of a clean 400.
+
+Verified: with the fix applied, requests with ≤1000 query-string fields are unaffected;
+requests with >1000 fields are rejected with 400 Bad Request (consistent with the POST-body
+behavior); Tornado's own httputil_test and web_test suites (256 tests) pass unchanged.

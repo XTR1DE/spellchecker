@@ -1,0 +1,47 @@
+Summary
+With @JsonTypeInfo(use = Id.NAME, defaultImpl = ...), every distinct unknown
+raw type ID selects the same fallback deserializer but is retained as a
+separate key in TypeDeserializerBase._deserializers. An attacker who can
+repeatedly supply new unknown type IDs can grow this process-lifetime cache
+without a configured bound.
+
+Details
+The affected path is TypeDeserializerBase._findDeserializer(). After an
+unknown name-based type ID resolves to the configured fallback/default
+implementation, jackson-databind caches the result under the attacker-provided
+raw typeId. Although all such IDs select the same fallback deserializer, each
+new string remains a distinct cache key.
+
+The behavior is runtime-confirmed in jackson-databind 2.22.1 and 3.2.1.
+Current 2.22 and 3.2 source branches retained the unbounded _deserializers
+map and per-raw-ID cache write when rechecked. The earlier affected floor has
+not been established, patched versions are: 2.18.11, 2.21.7, 2.22.3, 3.1.7 and 3.2.3.
+
+The vulnerable application must enable name-based polymorphism with a
+defaultImpl or equivalent fallback, accept attacker-influenced type IDs, and
+reuse a long-lived mapper/type deserializer across requests.
+
+Suggested correction: avoid caching each unknown raw ID when every such ID
+resolves to the same fallback, use a fallback sentinel, or use an explicitly
+bounded concurrency-safe cache. A regression should contrast many distinct
+unknown IDs with repetitions of one unknown ID across requests.
+
+PoC
+Configure a polymorphic base type with
+@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, defaultImpl = Fallback.class) and
+deserialize inputs containing unknown type names through the same mapper.
+Inspect TypeDeserializerBase._deserializers after the run.
+
+On affected 2.x and 3.x versions, 10,000 distinct unknown raw type IDs produce
+10,000 retained cache entries even though every input selects the same
+fallback deserializer. A matched control that repeats one unknown ID 10,000
+times produces one retained entry. This isolates attacker-controlled key
+cardinality from ordinary request count.
+
+Impact
+Where the stated polymorphic fallback configuration is exposed to
+attacker-influenced type IDs, distinct inputs cause incremental
+process-lifetime memory retention and eventual availability pressure or
+denial of service. This is not claimed as a single-request allocation spike,
+and no fixed bytes-per-ID or time-to-out-of-memory value is asserted. No
+confidentiality, integrity, or code-execution impact is claimed.

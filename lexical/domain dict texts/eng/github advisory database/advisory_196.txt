@@ -1,0 +1,108 @@
+Summary
+DBHub 0.21.2 exposes an unauthenticated HTTP MCP endpoint when started with the documented HTTP transport mode, for example --transport http --port 8080.
+
+The HTTP server attempts to protect browser-origin access by checking whether the Origin hostname equals the Host hostname, then reflecting the validated Origin into Access-Control-Allow-Origin. This does not stop DNS rebinding. After an attacker-controlled hostname rebinds to a victim-accessible DBHub HTTP server, both Origin and Host can contain the attacker-controlled hostname, so DBHub accepts the request and dispatches MCP tool calls.
+
+As a result, a malicious website can deterministically invoke DBHub MCP tools from the victim's browser without prompt injection or model involvement. With the default demo configuration this can read and write the demo SQLite database; with a real configured database, the same primitive can read, enumerate, and potentially write database contents depending on DBHub's configured tool permissions and database credentials.
+
+Recommended severity: High. It may become Critical when HTTP transport is connected to production or broadly privileged database credentials.
+
+Details
+Affected target:
+
+Package: @bytebase/dbhub
+Version tested: 0.21.2
+Repository commit tested: 72adfdcf7bcfe46b25edbc776ce096006eba9b02
+Affected mode: HTTP transport (--transport http)
+Default package transport: stdio
+Not affected by this specific browser-origin vector: stdio transport
+Relevant code path: src/server.ts
+
+The HTTP server installs a middleware that:
+
+reads req.headers.origin;
+extracts the hostname from req.headers.host;
+parses the hostname from Origin;
+rejects only when the two hostnames differ;
+reflects the validated Origin into Access-Control-Allow-Origin;
+enables credentials with Access-Control-Allow-Credentials: true.
+Relevant code:
+
+const origin = req.headers.origin;
+
+if (origin) {
+  const host = (req.headers.host ?? '').split(':')[0].toLowerCase();
+  try {
+    const originHost = new URL(origin).hostname.toLowerCase();
+    if (originHost !== host) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Origin does not match Host header (DNS rebinding protection)',
+      });
+    }
+  } catch {
+    return res.status(400).json({ error: 'Bad Request', message: 'Malformed Origin header' });
+  }
+}
+
+res.header('Access-Control-Allow-Origin', origin || 'http://localhost');
+res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+res.header('Access-Control-Allow-Headers', 'Content-Type, Mcp-Session-Id');
+res.header('Access-Control-Allow-Credentials', 'true');
+This blocks a simple cross-origin request such as:
+
+Host: localhost:8080
+Origin: http://attacker.example
+However, it accepts the DNS rebinding request shape:
+
+Host: dbhub-rebind.example:8080
+Origin: http://dbhub-rebind.example
+In a browser attack, the victim visits an attacker-controlled page such as http://dbhub-rebind.example:8080. The attacker initially resolves that hostname to the attacker's web server, serves JavaScript, then rebinds the hostname to the victim-accessible DBHub address on the same port. The browser can then send requests where the request host and browser origin are both the attacker-controlled hostname. The current check treats that as trusted because it verifies equality, not membership in an explicit allowed-host or allowed-origin policy.
+
+No authorization token, per-server secret, or CSRF-style capability is required before /mcp accepts JSON-RPC tool calls in HTTP mode. Therefore, once the rebinding request shape passes the hostname equality check, the browser can invoke the same MCP tools as an intended HTTP MCP client.
+
+Suggested remediation:
+
+Bind HTTP transport to 127.0.0.1 by default and require explicit opt-in for 0.0.0.0 or non-loopback hosts.
+Add an explicit allowed-hosts policy instead of accepting arbitrary Host values because Origin has the same hostname.
+Add an explicit allowed-origins policy and do not reflect arbitrary origins by default.
+Require an authentication token or CSRF-style capability before dispatching /mcp JSON-RPC methods.
+Consider rejecting browser-origin requests whose Host is not a configured loopback hostname or configured deployment hostname.
+PoC
+The following PoC is intended to be reproducible on another machine. It does not rely on any local files, local databases, private infrastructure, or custom audit tooling.
+
+Requirements:
+
+Node.js 20 or newer
+npm/npx access to install @bytebase/dbhub@0.21.2
+An available local TCP port selected by the script
+Save the following as dbhub-dns-rebinding-poc.mjs and run:
+
+node dbhub-dns-rebinding-poc.mjs
+The script starts DBHub 0.21.2 in demo HTTP mode on a local port, waits until it is ready, sends one blocked control request, sends the DNS-rebinding-shaped requests, prints the results, and terminates the DBHub process.
+
+Expected output:
+
+blocked.statusCode is 403.
+rebindToolsList.statusCode is 200.
+rebindToolsList.acao is http://dbhub-rebind.example.
+rebindRead.body contains STANDALONE_REBIND_CANARY.
+rebindWrite.body contains rows_written.
+reproduced is true.
+This PoC simulates the post-rebinding request shape by connecting to 127.0.0.1 while sending the attacker-controlled Host and Origin headers. It does not require a live external DNS server. A live browser exploit would use the same accepted request shape after DNS rebinding the attacker-controlled hostname to the DBHub server reachable from the victim browser.
+
+Impact
+An attacker who can get a victim to visit a malicious web page can make the victim's browser send MCP JSON-RPC requests to the victim-accessible DBHub HTTP server after DNS rebinding.
+
+If DBHub is connected to a real database, the attacker can:
+
+list DBHub MCP tools exposed by the server;
+execute execute_sql;
+enumerate tables and schemas;
+read database contents;
+run write queries when execute_sql is not configured as read-only;
+read the JSON-RPC response from browser JavaScript because DBHub reflects the attacker-controlled origin;
+exfiltrate query results through normal browser egress.
+This does not require prompt injection, a compromised AI client, or prior access to the victim's internal network. It only requires that the victim has DBHub HTTP transport running and reachable from the victim browser.
+
+The affected HTTP mode is opt-in, but it is a documented integration mode for web clients, shared servers, remote access, and clients that do not support stdio. Users may reasonably treat a local or internal DBHub HTTP endpoint as reachable only by their intended MCP client, while DNS rebinding lets an unrelated web page cross that browser-to-localhost/internal boundary.

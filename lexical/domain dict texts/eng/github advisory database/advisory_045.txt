@@ -1,0 +1,8 @@
+Impact
+Fastify routes a malformed URL under one plugin prefix to the custom not-found handler of a different sibling plugin, invoking the handler registered last and skipping the preHandler declared in its setNotFoundHandler(). When the request method has no route in the main router, a malformed request target reaches Fastify's internal not-found router before URL decoding and is dispatched through a single shared handler pointer, regardless of prefix and without the normal request lifecycle. An unauthenticated request to a public prefix can therefore reach an authentication-protected not-found handler registered under a different prefix and receive its full response, breaking prefix encapsulation and bypassing the authentication hook. Applications whose private or tenant fallbacks return protected data from a not-found handler are affected.
+
+Patches
+Patched in fastify 5.12.2. Malformed URLs are now routed through the configured onBadUrl and onMaxParamLength handlers so they fail closed before any application not-found handler runs, and the shared not-found handler pointer has been removed.
+
+Workarounds
+Reject malformed request targets before they reach the application, for example at an upstream proxy or gateway, and do not rely on a not-found handler to serve protected data. A global onRequest authentication hook does not mitigate this, because the malformed-URL path skips it.

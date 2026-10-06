@@ -1,0 +1,78 @@
+Summary
+GitPython 3.1.59 blocks a previously available local-file read path through unsafe git diff options such as -O/--orderfile.
+
+However, the high-level diff API still permits --no-index with the default allow_unsafe_options=False.
+
+--no-index changes the semantics of the paths arguments: instead of repository-relative pathspecs, Git interprets them as arbitrary filesystem paths.
+
+When combined with the still-allowed -I/--ignore-matching-lines option, this creates a content-dependent Boolean oracle over a caller-selected local file.
+
+This was reproduced against the published GitPython 3.1.59 wheel.
+
+The original unsafe-option path is blocked in 3.1.59, while this alternate path remains reachable without setting allow_unsafe_options=True.
+
+Details
+Confirmed API surface:
+
+repo.index.diff(
+None,
+no_index=True,
+I=pattern,
+paths=[baseline_path, target_path],
+create_patch=True,
+)
+
+The relevant behavior is:
+
+--no-index makes the two values supplied via paths filesystem operands rather than repository pathspecs.
+-I/--ignore-matching-lines makes Git's result depend on whether the supplied regular expression matches the relevant file content.
+GitPython exposes the resulting bit through distinguishable behavior:
+matching condition: normal return with an empty DiffIndex
+non-matching condition: GitCommandError with exit status 1
+An application that forwards attacker-influenced diff options and paths and exposes the success/error distinction can therefore be queried repeatedly to recover a guessable local single-line secret.
+
+The issue was confirmed with the default allow_unsafe_options=False.
+
+The behavior does not require the caller to explicitly opt into GitPython's unsafe-option mode.
+
+Verified intended security boundary:
+
+GitPython 3.1.58 accepts the earlier -O/--orderfile local-file input path.
+GitPython 3.1.59 rejects that same path with UnsafeOptionError.
+GitPython 3.1.59 still permits the --no-index alternate path described above.
+This appears to be an alternate route to the same local-file confidentiality property that the 3.1.59 diff option hardening is intended to protect.
+
+PoC
+A minimal reproducer, controlled extraction demonstrator, proof matrix, and proposed remediation are included in the attached package.
+
+gitpython-3159-maintainer-evidence.zip
+
+The minimal reproducer creates only temporary researcher-controlled files and demonstrates the following predicate:
+
+correct prefix -> normal GitPython return
+incorrect prefix -> GitCommandError(status=1)
+
+In the controlled extraction test, I generated three independent random single-line values and recovered all three exactly through repeated calls to the GitPython high-level API.
+
+Result: 3/3 recovered.
+
+The extraction harness also installs a Python audit hook that rejects direct Python open() access to the target file during the oracle phase. The content-dependent read is therefore performed by the child git process invoked through GitPython rather than by the reproduction script directly.
+
+Controls were also tested:
+
+normal repository-scoped diff: no secret disclosure
+same outside paths without --no-index: no arbitrary-filesystem interpretation
+deliberately incorrect predicate: status 1 as expected
+Suggested remediation is to classify --no-index as unsafe for the high-level diff API unless the caller explicitly sets allow_unsafe_options=True.
+
+Impact
+Potential impact is disclosure of local files readable by the process running GitPython.
+
+Exploitation requires an embedding application to allow an attacker to influence:
+
+the relevant diff options,
+both path operands, and
+repeated requests while exposing a distinguishable success/error result.
+The demonstrated attack is a blind content oracle rather than a one-request in-band file read. It is particularly applicable to short or structured single-line secrets where the target path and approximate value format are known or guessable.
+
+Confirmed affected release: GitPython 3.1.59.

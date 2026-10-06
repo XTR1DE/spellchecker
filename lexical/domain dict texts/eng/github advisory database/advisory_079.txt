@@ -1,0 +1,56 @@
+Summary
+Axios form serialization reads visitor, maxDepth, dots, indexes, metaTokens, and Blob from an internal options object without own-property guards. When Object.prototype has been polluted elsewhere in the same process, those inherited values can change how axios serializes multipart and URL-encoded request bodies.
+
+Axios does not create the prototype pollution source. This is a read-side gadget: axios turns an existing same-process pollution condition into altered request serialization or request failures.
+
+Impact
+The impact depends on which property is polluted and which axios serialization path the application uses.
+
+Polluted dots, indexes, or metaTokens can change field names and cause the receiving service to parse different data than the caller intended. Polluted maxDepth can cause nested form submissions to throw ERR_FORM_DATA_DEPTH_EXCEEDED, producing request-level or service-level denial of service for affected workflows. Polluted visitor can execute as the serializer visitor if an attacker can place a function on Object.prototype, but that condition generally implies a stronger same-process code-execution or malicious-dependency primitive and should be described carefully.
+
+Affected Functionality
+Affected:
+
+axios.toFormData().
+transformRequest paths that serialize plain objects to multipart/form-data.
+URL-encoded form serialization paths that rely on the same helper.
+formSerializer option defaults when the relevant properties are absent as own properties.
+Not affected:
+
+JSON request bodies.
+Requests that do not invoke toFormData().
+Processes where Object.prototype is not polluted.
+Technical Details
+lib/helpers/toFormData.js merges caller options with defaults using utils.toFlatObject(). When options is undefined, toFlatObject() returns the default object unchanged:
+
+{
+  metaTokens: true,
+  dots: false,
+  indexes: false
+}
+That default object has Object.prototype in its prototype chain. toFormData() then reads behavior-affecting values directly:
+
+const metaTokens = options.metaTokens;
+const visitor = options.visitor || defaultVisitor;
+const dots = options.dots;
+const indexes = options.indexes;
+const _Blob = options.Blob || (typeof Blob !== 'undefined' && Blob);
+const maxDepth = options.maxDepth === undefined ? DEFAULT_FORM_DATA_MAX_DEPTH : options.maxDepth;
+These reads can resolve inherited polluted properties.
+
+Local code review confirmed the direct reads in v1.18.1. Tag checks show the option-based form serializer exists in v0.28.0 and later; maxDepth appears in the 1.x line from the form recursion fix.
+
+Proof of Concept of Attack
+Constrained local demonstration:
+
+Object.prototype.maxDepth = 1;
+
+await axios.post(url, { a: { b: { c: 'value' } } }, {
+  headers: { 'Content-Type': 'multipart/form-data' }
+});
+Expected safe behavior is that the default max depth is used unless the caller sets an own formSerializer.maxDepth. Current behavior reads the inherited value and can throw ERR_FORM_DATA_DEPTH_EXCEEDED.
+
+For serializer alteration, polluting Object.prototype.dots = true changes nested field naming from bracket notation to dot notation when the caller did not opt into that behavior.
+
+Workarounds
+Avoid serializing attacker-controlled objects as form data in a process with known prototype pollution. As a partial mitigation, callers can pass an own formSerializer object that sets explicit safe values for all relevant keys, including visitor, maxDepth, dots, indexes, metaTokens, and Blob.

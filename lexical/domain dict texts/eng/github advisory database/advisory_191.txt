@@ -1,0 +1,8 @@
+Impact
+Users of the python-hyper/hpack library, most commonly used as downstream dependency of the python-hyper/h2 library (an HTTP/2 client and server implementation). Unbounded variable integer decoding can cause run-away computation on malformed input leading to O(n^2) runtime, effectively blocking further processing with large enough unsanitized input.
+
+Patches
+A fix is available in python-hyper/hpack v4.2.0 to restricted variable integer decoding to uint32 to prevent run-away computation.
+
+Workarounds
+Sanitize input to hpack decoder for long sequences of 0xFF values to prevent malicious use.

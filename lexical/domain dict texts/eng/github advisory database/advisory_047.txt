@@ -1,0 +1,8 @@
+Impact
+Fastify lowercases header-schema property names before compiling the schema, because Node.js stores request header names in lowercase. That normalization was incomplete: it lowercased only top-level properties keys and the root required array, and did not lowercase the JSON Schema Draft 7 dependencies keyword (its trigger keys and dependent property names) or names in nested subschemas. As a result, a header schema that uses dependencies to require one header when another is present (for example X-Admin requiring X-Admin-Token) never matches the lowercased request headers, so the dependency assertion is silently skipped. An unauthenticated remote client can send the header that activates a privileged path while omitting the header the dependency was meant to require, bypassing a schema-enforced security control. The header schema is idiomatic, valid JSON Schema Draft 7, and no custom validator, malformed request, or misconfiguration is required.
+
+Patches
+Header-schema names are now normalized across all schema positions (properties, required, dependencies, dependentRequired, dependentSchemas, and nested subschemas). Patched in fastify 5.12.2. The fix is also included in the 6.0.0 release. Header schemas referenced through an external shared $ref (registered with addSchema) are not reached by this normalization and now emit an FSTSEC002 startup warning; inline the header schema to keep case-insensitive assertions in effect.
+
+Workarounds
+If upgrading is not immediately possible, write header-schema names in lowercase so the dependencies and other case-sensitive assertions match Node's lowercased request headers, or enforce the cross-header requirement in an onRequest or preValidation hook instead of the schema.

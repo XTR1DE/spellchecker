@@ -1,0 +1,44 @@
+Impact
+An attacker who knows a victim's password fully bypasses that account's 2FA and obtains a persistent token with full API access as the user (read and write across the user's permissions, including admin if the victim is an admin).
+
+The token is an API credential, not a web/UI session (using it on web routes redirects to /login), but the REST API covers essentially the whole application. If the victim is an admin, the token can also call the admin users/two_factor_reset endpoint, which is in the same un-gated API surface, to clear the account's enrolled 2FA. The next login is then forced to re-enroll a second factor, which the password-holding attacker can complete with their own device, taking over the account's web access and locking the legitimate user out.
+
+Summary:
+2FA is enforced only by the web middleware group, not the api group, and the personal-access-token endpoint is in the api group. A session that has passed the password check but not the 2FA can mint a persistent API token and use it for full API access.
+
+Details:
+CheckForTwoFactor is in the web group but not the api group:
+
+// app/Http/Kernel.php
+'web' => [ ..., CheckForTwoFactor::class, CreateFreshApiToken::class, ... ],
+'api' => [ 'auth:api', EnforceApiUserAgent::class, ... ],   // no CheckForTwoFactor
+Two consequences:
+
+/two-factor is exempt from the check, and CreateFreshApiToken runs right after it in the web group:
+
+// app/Http/Middleware/CheckForTwoFactor.php
+public const IGNORE_ROUTES = ['two-factor', 'two-factor-enroll', 'setup', 'logout'];
+
+So a password-authenticated session that lands on /two-factor (before entering a code) is let through and gets issued the Passport snipeit_passport_token cookie.
+
+The token endpoint is in the api group, which never checks 2FA, gated only by self.api:
+
+// routes/api.php -> Api\ProfileController::createApiToken (line 98)
+if (! Gate::allows('self.api')) { ... } // the only gate; no 2FA check
+
+Login authenticates on the password alone (LoginController::login calls Auth::login). 2FA is enforced only by web middleware on later page loads. So between a correct password and a completed second factor the session is already authenticated, can grab the Passport cookie via /two-factor, and can call the token endpoint over the api group. The token is long-lived (40-year expiry by default) and grants full API access as the user.
+
+Proof of concept:
+Setup: an account with 2FA enabled and the self.api permission (the permission that governs API access, so any account meant to use the API has it). The attacker has the password but not the TOTP device, and never completes the second factor.
+
+Step 3 returns a token with no code ever submitted, and step 4 returns the victim's own account ({"id":1,"username":"victim","email":...}). Meanwhile the same session is still blocked from every web page until 2FA is completed, which shows the api group simply never enforces it.
+
+Patches
+Fixed in commit 87c362962a via PR #19294 (FD-56499). The fix adds a new API-side middleware, EnforceApiTwoFactorEnrollment, registered on the api middleware group after auth:api. The new middleware answers the question "does this token's owner have a second factor enrolled at all?", which is orthogonal to the session-scoped 2fa_authed flag that CheckForTwoFactor relies on. Behavior:
+
+Passes through when there's no authenticated user (leaves the standard auth:api 401 in place).
+Passes through when two_factor_enabled is disabled in settings.
+Under optional mode (two_factor_enabled = '1'), only enforces on users who explicitly set two_factor_optin = '1', matching the web-side behavior and preserving legacy PATs for users who never opted in.
+Under required mode (two_factor_enabled = '2'), enforces regardless of optin.
+Blocks with 403 + Helper::formatStandardApiResponse('error', null, trans('auth/message.two_factor.please_enroll')) when the token owner's two_factor_enrolled != '1'.
+Regression coverage lives in tests/Feature/Authentication/EnforceApiTwoFactorEnrollmentTest.php.

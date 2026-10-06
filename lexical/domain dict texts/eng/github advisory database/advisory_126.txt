@@ -1,0 +1,8 @@
+Impact
+undici's BalancedPool passes its constructor options through a JSON-based deep clone (JSON.parse(JSON.stringify(...))) before forwarding them to each per-upstream Pool. JSON cannot represent functions, so a caller-supplied connect or tls option containing a checkServerIdentity callback (or a custom connector function) is silently dropped before it reaches the TLS layer. As a result, a TLS peer whose certificate a custom checkServerIdentity was written to reject, but which passes Node's default hostname and chain checks, is silently accepted when the request is made through BalancedPool. Client, Pool, Agent, and RoundRobinPool destructure connect/tls before the clone and are not affected. Only applications that use BalancedPool with a function-valued connect/tls option (such as a custom checkServerIdentity or connector) are affected.
+
+Patches
+Upgrade to 7.29.1 or 8.10.2. BalancedPool now preserves the connect and tls options outside the JSON clone, so custom TLS verification callbacks are forwarded to each upstream unchanged.
+
+Workarounds
+Use Client, Pool, or Agent instead of BalancedPool for connections that rely on a custom checkServerIdentity or connector, until upgraded.

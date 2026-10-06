@@ -1,0 +1,16 @@
+Summary
+hono/jsx does not HTML-escape a plain string placed directly as a child or fallback of Suspense or ErrorBoundary, as the only child of a Context.Provider, or as the root value of renderToString() / renderToReadableStream() from hono/jsx/dom/server. Such a string is emitted as markup instead of text.
+
+Details
+These paths stringify their input and treat the result as already-escaped HTML, so a plain string passes through unchanged. Notable cases:
+
+Suspense: a string child, or a string fallback while a child suspends. With streaming, the fallback reaches the browser in the initial chunk.
+ErrorBoundary: a string child alongside an asynchronous sibling. The all-synchronous case was fixed in 4.11.7 (GHSA-9r54-q6cx-xmh5).
+Context.Provider: a single string child. Multiple children are escaped.
+hono/jsx/dom/server: a string, or an array containing strings, passed as the root.
+A lone {children} forwarded by a wrapper component is enough to reach these paths. Strings wrapped in an element, values from raw() or the html helper, and client-side rendering with hono/jsx/dom are not affected.
+
+Impact
+An attacker who controls a string rendered in an affected position can inject arbitrary HTML into the server-rendered page, leading to cross-site scripting under the application's origin.
+
+This issue affects applications that render untrusted strings directly in one of the positions above during server-side rendering.

@@ -1,0 +1,49 @@
+Summary
+Expanding {a},b}-shaped input takes time quadratic in the number of literal } characters, blocking the event loop.
+
+Bash preserves a quirk where a brace group followed by a comma set still expands ({a},b}). The parser implements this by rewriting the string and restarting the scan. Each pass absorbs exactly one } and re-scans from the beginning, so n trailing braces cost n full passes.
+
+Reproduction
+const build = n => '{a}' + '}'.repeat(n) + ',z}'
+
+for (const n of [8000, 16000, 32000, 64000, 128000]) {
+  const t = Date.now()
+  expand(build(n))
+  console.log(n, Date.now() - t + 'ms')
+}
+n	input	time	results
+8,000	8 KB	110 ms	2
+16,000	16 KB	446 ms	2
+32,000	32 KB	1.7 s	2
+64,000	64 KB	6.9 s	2
+128,000	128 KB	27.7 s	2
+ms/n^2 is flat at ~1.7 and each doubling of n costs exactly 4.0x - quadratic. 128 KB of input blocks the event loop for nearly half a minute to produce two results.
+
+Mechanism
+Instrumenting the rewrite branch confirms it runs exactly n + 1 times, once per literal }, each re-scanning the whole string.
+
+There is a second multiplier. The rewrite replaces the group's closing } with the internal escClose sentinel, which is '\0CLOSE' + Math.random() + '\0' - about 25 characters. The working string therefore grows by ~25 characters on every pass:
+
+n	input length	final string length
+1,000	1,006	26,006
+8,000	8,006	208,006
+So the input is inflated roughly 26x, and that factor multiplies both the quadratic constant and peak memory. This makes it partly a memory-pressure issue as well as a CPU one.
+
+Why max and maxLength do not help
+The cost is in parsing, before the result set exists. The payload yields 2 results regardless of size, so neither bound is ever reached.
+
+Impact
+An application passing an untrusted pattern to expand(), directly or through minimatch / glob, can have its event loop blocked for tens of seconds by a payload well under minimatch's 65,536-character cap. For a single-threaded Node server that is a full stall, not just a slow request.
+
+Degraded availability rather than a crash - the process recovers once the expansion completes.
+
+Affected versions
+Verified affected on 1.1.18, 2.1.4, 3.0.6 and 5.0.9, all within a few percent of each other (~460-490 ms at n=16,000).
+
+Patch
+The rewrite loop gets an iteration bound. Past the cap the remaining string is treated as non-expanding and returned literally, consistent with the existing max / maxLength caps, which truncate rather than throw.
+
+Note this bounds the number of passes, not the cost of each: worst-case work remains proportional to cap x input length. The cap is set low enough that the residual is bounded in practice, and far above what any realistic {a},b} input needs.
+
+Severity note
+Scored 5.3 Medium (A:L) for consistency with GHSA-3jxr-9vmj-r5cp, the other algorithmic-complexity advisory on this package (CWE-407), which uses the same vector. The stack-exhaustion advisories on this package score A:H because they crash the process outright; this one stalls it.

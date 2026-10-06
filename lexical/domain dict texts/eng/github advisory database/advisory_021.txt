@@ -1,0 +1,2 @@
+Description
+Under very constrained circumstances, data that was parsed and then passed to uneval could turn a small payload into a very large serialized string.

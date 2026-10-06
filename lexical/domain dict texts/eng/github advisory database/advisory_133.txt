@@ -1,0 +1,14 @@
+Impact
+Popups opened from a sandboxed iframe through a link (for example target="_blank" or a middle-click) did not inherit the iframe's HTML sandbox restrictions. Content that was meant to run sandboxed could open a popup with the embedding app's full origin, gaining access to that origin's cookies, storage, and same-origin scripting.
+
+Apps are only affected if they embed untrusted content in iframes sandboxed with allow-scripts allow-popups. Apps that do not embed untrusted content in sandboxed iframes are not affected.
+
+Workarounds
+Use setWindowOpenHandler on the parent WebContents to deny or constrain popups opened from sandboxed frames, or do not apply allow-popups to sandboxed iframes that render untrusted content.
+
+Fixed Versions
+43.0.0
+42.5.2
+41.10.4
+For more information
+If you have any questions or comments about this advisory, email us at security@electronjs.org

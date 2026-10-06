@@ -1,0 +1,45 @@
+Summary
+Axios for Node.js does not apply configured DNS lookup or proxy controls when a request uses httpVersion: 2. The HTTP/1 adapter path wraps and forwards config.lookup, builds normal request options, and applies proxy routing through setProxy(). The HTTP/2 path builds a session with http2.connect() using only options.http2Options, which drops the top-level lookup, agent, and proxy state.
+
+Applications are affected when they allow a user to influence request destinations, enable axios HTTP/2, and rely on axios lookup or proxy routing to prevent SSRF or enforce outbound network policy.
+
+Impact
+In affected server-side deployments, an attacker can cause axios to connect directly to destinations that the configured resolver or proxy would have rejected. Depending on reachable services, this can expose cloud metadata, internal service responses, or allow state-changing requests to internal systems.
+
+This is not an unconditional SSRF in every axios deployment. It requires httpVersion: 2 and an application-level trust boundary where user-influenced URLs are constrained by lookup or proxy policy.
+
+Affected Functionality
+Affected:
+
+Node.js HTTP adapter with httpVersion: 2.
+config.lookup supplied as a DNS policy.
+Explicit config.proxy and environment-derived proxy settings for HTTPS HTTP/2 requests.
+Not affected:
+
+Browser adapters.
+Node HTTP/1 requests, which pass lookup to the transport and apply proxy handling.
+Applications that validate destination hosts independently before calling axios.
+Technical Details
+In lib/adapters/http.js, the adapter reads lookup, wraps it, stores it on the request options, and applies setProxy() before selecting a transport. For HTTP/2, http2Transport.request() builds an authority from options.protocol, options.hostname, and options.port, then calls:
+
+const { http2Options, headers } = options;
+const session = http2Sessions.getSession(authority, http2Options);
+lib/helpers/Http2Sessions.js ultimately calls http2.connect(authority, options) with only the http2Options object. The configured DNS lookup and the proxy or tunneling agent installed on the top-level request options are not forwarded into that call.
+
+Local verification on axios 1.18.1 showed lookupCalls: 0 while an HTTP/2 request to a local h2 origin succeeded. A second local HTTPS h2 verification with an explicit rejecting HTTP proxy showed the origin received the request and the proxy observed no traffic.
+
+Proof of Concept of Attack
+Local constrained demonstration:
+
+Start an HTTP/2 server on loopback.
+Call axios.get("http://localhost:<port>/internal", { httpVersion: 2, lookup }) where lookup throws EPOLICY.
+Observe that the request succeeds and the lookup counter remains 0.
+For proxy routing:
+
+Start an HTTPS HTTP/2 origin and a local HTTP proxy that rejects every request and CONNECT.
+Call axios with httpVersion: 2, http2Options: { rejectUnauthorized: false }, and explicit proxy.
+Observe that the origin receives the request and the proxy receives nothing.
+Expected safe behavior is that either the lookup policy blocks the request or the proxy observes and rejects the request.
+
+Workarounds
+Use the HTTP/1 adapter path for requests that depend on axios lookup or proxy controls. Alternatively, enforce destination allow/deny policy before calling axios, outside the adapter transport path.

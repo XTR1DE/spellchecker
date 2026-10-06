@@ -1,0 +1,8 @@
+Impact
+An attacker who uses this vulnerability can craft a PDF which leads to long runtimes. This requires updating form field values with flattening enabled, which triggers appearance stream generation.
+
+Patches
+This has been fixed in pypdf==6.19.0.
+
+Workarounds
+If you cannot upgrade yet, consider applying the changes from PR #4087.

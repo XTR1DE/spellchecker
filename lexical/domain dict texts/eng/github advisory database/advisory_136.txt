@@ -1,0 +1,15 @@
+Impact
+A <webview> could enable Node.js integration in its Web Workers even when its embedder had Node.js integration disabled, giving guest content more privilege than the embedder allowed.
+
+Apps are only affected if they enable the <webview> tag and the embedder is unsandboxed. Apps that do not use <webview>, or that keep the embedder sandboxed, are not affected.
+
+Workarounds
+Remove nodeIntegrationInWorker from the guest preferences in a will-attach-webview handler, or do not enable the <webview> tag when loading untrusted content.
+
+Fixed Versions
+44.0.0-beta.5
+43.4.1
+42.9.2
+41.10.6
+For more information
+If you have any questions or comments about this advisory, email us at security@electronjs.org

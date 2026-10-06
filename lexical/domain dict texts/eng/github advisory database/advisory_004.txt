@@ -1,0 +1,59 @@
+Summary
+/api/file/getUniqueFilename takes a path from the request body and passes it to a filesystem existence check with no validation, confinement or authorization. The response distinguishes paths that exist from paths that do not, so an anonymous reader in publish mode can probe arbitrary locations on the host, one request per probe. Files and directories both work.
+
+Every neighbouring file route either requires an administrator or confines the path first.
+
+Details
+Route. kernel/api/router.go:289 on master, :292 on the development branch, CheckAuth only.
+
+Handler, kernel/api/file.go:84, in full:
+
+util.ParseJsonArgs(arg, ret, util.BindJsonArg("path", &filePath, true, true))
+ret.Data = map[string]any{"path": util.GetUniqueFilename(filePath)}
+The argument binder does no path handling. util.BindJsonArg (kernel/util/net.go:365) takes two booleans, required (the key must be present) and rejectEmpty (the value must be non-empty). That is its entire contract. There is no filepath.Clean, no workspace join, no traversal check. An absolute path outside the workspace reaches gulu.File.IsExist unmodified.
+
+The oracle. util/file.go:67:
+
+if !gulu.File.IsExist(filePath) {
+    return filePath
+}
+// otherwise loop, returning the first non-existent dir/base (i).ext
+Input echoed back means the path does not exist. A (1) suffix means it does.
+
+The asymmetry.
+
+Route	Middleware
+putFile, copyFile, globalCopyFiles, workspaceCopyFiles, removeFile, renameFile	CheckAuth, CheckAdminRole, CheckReadonly
+readDir (directory enumeration)	CheckAuth, CheckAdminRole
+getFile	CheckAuth, but GetAbsPathInWorkspace returns 403 on escape, plus rejectEncryptedBoxPath and a publish-access check
+getUniqueFilename	CheckAuth, nothing else
+getFile binds the identical BindJsonArg("path", &filePath, true, true) and confines it as its first action.
+
+Proof of Concept
+Kernel 3.7.2, publish mode on port 6808, Publish.Auth.Enable false, anonymous client. Reader context confirmed by getChildBlocks returning HTTP 403 on the same session.
+
+{"path":"/etc/passwd"}
+→ {"code":0,"msg":"","data":{"path":"/etc/passwd (1)"}}
+
+{"path":"/etc/shadow"}
+→ {"code":0,"msg":"","data":{"path":"/etc/shadow (1)"}}
+
+{"path":"/etc/definitely-not-here"}
+→ {"code":0,"msg":"","data":{"path":"/etc/definitely-not-here"}}
+Directories behave the same way:
+
+{"path":"/root"}      → {"path":"/root (1)"}
+{"path":"/rootnope"}  → {"path":"/rootnope"}
+And within the workspace, confirming whether a specific document file exists:
+
+{"path":"<workspace>/data/<boxID>/<docID>.sy"}  → "<...> (1).sy"
+{"path":"<workspace>/data/nope-no-such.sy"}     → echoed unchanged
+Impact
+An anonymous reader in publish mode, or any publish RoleReader, determines whether arbitrary paths exist on the host. Because directories respond the same way as files, the filesystem can be walked rather than only guessed at. This supports identifying the operating-system user's home directory, detecting installed software, backup and synchronisation directories, mapping the workspace layout, and confirming the existence of specific documents by probing their storage paths.
+
+It also composes with the absolute workspace path returned elsewhere, which supplies a concrete prefix rather than requiring guesswork, and it recovers the operating-system username that the browser-request path strip added under issue #17410 was introduced to conceal.
+
+Scoped precisely: nothing is read and nothing is written. This is an existence and layout disclosure, valuable primarily as a reconnaissance step.
+
+Suggested fix
+Confine the path as the adjacent getFile route does, by routing filePath through util.GetAbsPathInWorkspace and returning 403 on escape, or add CheckAdminRole and CheckReadonly to match readDir. The frontend uses this endpoint only for naming uploads and assets inside the workspace, so neither change affects legitimate use.

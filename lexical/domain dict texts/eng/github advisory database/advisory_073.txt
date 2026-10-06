@@ -1,0 +1,39 @@
+Summary
+Axios supports proxy environment variables and evaluates NO_PROXY exclusions in the Node.js adapter. CIDR-form NO_PROXY entries such as 127.0.0.0/8, 10.0.0.0/8, or 169.254.169.254/32 are not interpreted as IP ranges. As a result, a request to an IP address inside a configured CIDR exclusion can still be sent through the configured proxy.
+
+This affects deployments that rely on CIDR notation to keep loopback, private, Kubernetes, CI, or cloud metadata traffic away from proxy infrastructure.
+
+Impact
+If the configured proxy is outside the intended trust boundary, requests that operators expected to bypass the proxy may be exposed to it. For plaintext HTTP targets, the proxy can see and modify URLs, headers, and bodies. For HTTPS targets, the proxy still observes connection metadata and may receive CONNECT requests that policy expected to avoid.
+
+This is a proxy exclusion bypass, not arbitrary proxy injection by itself.
+
+Affected Functionality
+Affected:
+
+Node.js adapter proxy environment handling.
+HTTP_PROXY, HTTPS_PROXY, NO_PROXY, or lowercase equivalents.
+CIDR entries in NO_PROXY.
+Not affected:
+
+Exact host or exact IP NO_PROXY entries where axios matching succeeds.
+Requests configured with proxy: false.
+Browser adapters.
+Technical Details
+lib/helpers/shouldBypassProxy.js parses each NO_PROXY entry into a host and optional port, normalizes hostnames, and then compares exact hostnames, suffix entries, wildcard-prefix entries, and loopback equivalents. It does not parse CIDR notation.
+
+Local verification on axios 1.18.1:
+
+process.env.NO_PROXY = '127.0.0.0/8';
+shouldBypassProxy('http://127.0.0.1:1234/'); // false
+The expected result for CIDR-aware bypass policy is true.
+
+Proof of Concept of Attack
+Constrained local demonstration:
+
+Set HTTP_PROXY=http://127.0.0.1:<proxy-port>.
+Set NO_PROXY=127.0.0.0/8.
+Request http://127.0.0.1:<internal-port>/metadata.
+Observe that axios sends the request through the proxy instead of directly to the internal listener.
+Workarounds
+Use exact host or IP entries in NO_PROXY for sensitive destinations until CIDR matching is fixed, for example 127.0.0.1,localhost,169.254.169.254. For individual requests that must not use a proxy, set proxy: false.

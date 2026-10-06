@@ -1,0 +1,35 @@
+Summary
+expand_() recurses once per level of brace nesting. Deeply nested input exhausts the native stack and crashes the process.
+
+This is distinct from CVE-2026-14257 / GHSA-mh99-v99m-4gvg, which made the tail iterative (recursion on m.post, driven by how many groups are chained). Nesting depth drives a different recursion that the tail fix never touched, so the documented constant-stack-depth guarantee only ever covered chained input, not nested input.
+
+It is also distinct from GHSA-6j4f-fj2g-mc7p, which fixed recursion in parseCommaParts(). Both payloads below still crash with that fix applied.
+
+Two recursion sites
+Comma members. Each alternative of a brace set is expanded by a recursive call, so nesting a set inside every alternative recurses once per level:
+
+expand('{a,'.repeat(4000) + 'z' + '}'.repeat(4000))
+// RangeError: Maximum call stack size exceeded
+Crashes at depth 3,907 - about 15.6 KB of input.
+
+Single set. A brace set whose body parses to a single part is expanded by a recursive call before being re-wrapped (x{{a,b}}y -> x{a}y x{b}y), which recurses once per nesting level:
+
+expand('{'.repeat(3200) + 'a,b' + '}'.repeat(3200))
+// RangeError: Maximum call stack size exceeded
+Crashes at depth 3,125 - about 6.25 KB of input. This is the cheapest stack-exhaustion payload known against this package: roughly a quarter the input of GHSA-6j4f-fj2g-mc7p (29 KB), and about a tenth of minimatch's MAX_PATTERN_LENGTH (65,536).
+
+Why max and maxLength do not help
+Both crashes happen while recursing into sub-expansions, before the result set grows. The payloads produce almost no output - the single-set case yields 2 results - so neither bound is ever the limiter. expand(payload, { max: 1, maxLength: 1 }) still overflows.
+
+Impact
+Any application passing an untrusted string to expand(), directly or through minimatch / glob as a user-supplied glob pattern, can be crashed. In Node a RangeError the application does not catch terminates the process, so a server globbing user input is exposed to remote unauthenticated denial of service.
+
+Availability only. No code execution, no data exposure.
+
+Affected versions
+Verified affected on 1.1.18, 2.1.4, 3.0.6 and 5.0.9, at near-identical depths on every line (single set: 3,125 on all four; comma members: 3,907-4,102). Not a regression from any recent fix - the gap predates them.
+
+Patch
+A maxDepth bound (default EXPANSION_MAX_DEPTH) is threaded through expand_(). Past the cap a group is treated as non-expanding and returned literally, which is how the parser already handles a group that cannot expand. This matches the existing max / maxLength caps, which truncate rather than throw, so expand() continues never to throw on any input.
+
+The default sits far above any realistic nesting depth and well below the crash threshold.

@@ -1,0 +1,6 @@
+Impact
+The vulnerability allows an attacker to bypass the HTML sanitizer by using the data-html-content attribute in the content of a SharpEditorFormField.
+
+Patches
+The field must now explicitly configure SharpFormEditorField::RAW_HTML in the toolbar to keep this behavior. When using the RAW_HTML button, the application using code16/sharp must sanitize manually the content coming from the field.
+Vulnerability has been patched in version 9.22.5.

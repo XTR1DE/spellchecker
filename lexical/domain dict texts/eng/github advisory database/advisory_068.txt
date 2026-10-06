@@ -1,0 +1,10 @@
+Impact
+When server credentials are created with the requireClientCertificate option set to false, getAuthContext does not distinguish between authorized and unauthorized certificates in its return value. This can create improper authentication vulnerabilities for @grpc/grpc-js users who use the result of getAuthContext for authentication.
+
+In particular, @grpc/grpc-js-xds can both set the requireClientCertificate option to false and use the return value of getAuthContext for RBAC authentication in some configurations.
+
+Patches
+This vulenrability is fixed in 1.13.6 and 1.14.5.
+
+Workarounds
+@grpc/grpc-js users using getAuthContext this way can avoid this problem by setting requireClientCertificate to true. @grpc/grpc-js-xds users using RBAC can avoid this by setting the require_client_certificate field to true in the DownstreamTlsContext in the xDS configuration.

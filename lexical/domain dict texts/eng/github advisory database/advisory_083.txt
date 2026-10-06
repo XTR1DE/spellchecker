@@ -1,0 +1,20 @@
+Impact
+The Node.js ImageResponse implementation from next/og is affected by an upstream vulnerability. This can lead to remote code execution.
+
+Affected applications pass attacker-controlled values into SVG content, attributes, or styles during image generation:
+
+import { ImageResponse } from 'next/og'
+
+export async function GET(request: Request) {
+  const value = new URL(request.url).searchParams.get('value') ?? ''
+
+  return new ImageResponse(
+    <svg width="1200" height="630">
+      <title>{value}</title>
+    </svg>
+  )
+}
+Applications using the Edge ImageResponse implementation, or applications that do not pass attacker-controlled values into SVG content, attributes, or styles, are not affected.
+
+Workaround
+If upgrading is not immediately possible, do not pass attacker-controlled values into SVG content, attributes, or styles rendered by the Node.js ImageResponse implementation from next/og.

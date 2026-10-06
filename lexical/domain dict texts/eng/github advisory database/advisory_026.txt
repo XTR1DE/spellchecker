@@ -1,0 +1,7 @@
+BatchActivator.quote() returned its input unchanged, the only activator with no escaping at all. --prompt, the VIRTUALENV_PROMPT environment variable, and the config file all set the prompt, and activate.bat writes it straight into @set "VAR=value". A prompt containing a double quote closes that string early, and whatever follows runs as live cmd.exe syntax:
+
+$ virtualenv --prompt 'x" & calc & "' venv
+$ venv\Scripts\activate.bat
+runs calc the moment someone activates the environment. Confirmed on a real Windows runner. Anyone who templates a prompt from untrusted input (a CI job using a branch name, a wrapper script deriving an environment name from user input) hands an attacker code execution in the shell of anyone who activates the resulting venv on Windows.
+
+Fixed in 21.7.12 by escaping the characters cmd.exe treats as live syntax inside this construct. Fix: pypa/virtualenv#3250

@@ -1,0 +1,8 @@
+Impact
+An attacker who uses this vulnerability can craft a PDF which leads to long runtimes. This requires a partially malformed /FlateDecode stream, where the byte-by-byte decompression is used.
+
+Patches
+This has been fixed in pypdf==6.18.1.
+
+Workarounds
+If you cannot upgrade yet, consider applying the changes from PR #4073.

@@ -1,0 +1,12 @@
+Impact
+undici's WebSocketStream crashes the client process when a WebSocket connection is closed abruptly without a close handshake. On such an unclean close, the internal socket-close handler calls abort() on the writable stream even when the application holds a writer lock. Per the WHATWG Streams standard, aborting a locked stream returns a promise that rejects with a TypeError, and the handler discards that promise. The unobserved rejection surfaces as an unhandledRejection and, under Node.js's default behavior, terminates the process.
+
+A malicious or compromised WebSocket server can crash a client with a single connection teardown (a TCP reset, a proxy teardown, or a protocol-violating frame). Affected applications are those using the WebSocketStream API and writing through a writer, which is the standard way to write.
+
+All releases from undici 7.0.0 are affected. WebSocketStream was introduced in 7.0.0.
+
+Patches
+Upgrade to undici v7.29.1 or v8.10.2.
+
+Workarounds
+No workaround is available.

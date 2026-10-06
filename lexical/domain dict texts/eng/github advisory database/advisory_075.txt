@@ -1,0 +1,60 @@
+Summary
+Axios fetch adapter requests can be altered by inherited properties on fetchOptions. The adapter resolves method, headers, body, signal, and credentials into resolvedOptions, creates a Request, and then calls fetch(request, fetchOptions) instead of fetch(request, resolvedOptions). In runtimes such as Node's undici-backed fetch, inherited fetchOptions.headers can override the headers already placed on the Request.
+
+Axios does not create the prototype pollution source. This is a read-side gadget that becomes exploitable after same-process prototype pollution.
+
+Impact
+An attacker with a prior prototype-pollution primitive can cause affected fetch-adapter requests to send attacker-controlled headers and drop caller-specified headers. This can affect authorization, cache behavior, metadata-service interactions, or application-specific header-based controls.
+
+The issue is specific to fetch-adapter behavior and does not affect Node HTTP adapter requests.
+
+Affected Functionality
+Affected:
+
+adapter: 'fetch'.
+Runtime environments where the fetch adapter is selected.
+Requests where fetchOptions is an object that does not have safe own values for sensitive fetch init fields.
+Not affected:
+
+Node HTTP adapter.
+Requests that do not use the fetch adapter.
+Processes where Object.prototype is not polluted.
+Technical Details
+lib/adapters/fetch.js builds:
+
+const resolvedOptions = {
+  ...fetchOptions,
+  signal: composedSignal,
+  method: method.toUpperCase(),
+  headers: toByteStringHeaderObject(headers.normalize()),
+  body: data,
+  duplex: 'half',
+  credentials: isCredentialsSupported ? withCredentials : undefined,
+};
+
+request = isRequestSupported && new Request(url, resolvedOptions);
+
+let response = await (isRequestSupported
+  ? _fetch(request, fetchOptions)
+  : _fetch(url, resolvedOptions));
+The fallback path without Request uses resolvedOptions, but the Request path passes the original fetchOptions as the second argument to fetch(). That second argument can contain inherited properties from Object.prototype.
+
+Local verification on axios 1.18.1 set Object.prototype.headers = { Authorization: 'Bearer POLLUTED' } and called the fetch adapter with headers: { 'X-Good': 'yes' }, fetchOptions: {}. The loopback server received Authorization: Bearer POLLUTED and did not receive X-Good.
+
+Proof of Concept of Attack
+Constrained local demonstration:
+
+Object.prototype.headers = { Authorization: 'Bearer POLLUTED' };
+try {
+  await axios.get(url, {
+    adapter: 'fetch',
+    headers: { 'X-Good': 'yes' },
+    fetchOptions: {}
+  });
+} finally {
+  delete Object.prototype.headers;
+}
+Expected safe behavior is that the sanitized axios headers remain in force. Current behavior can use the inherited fetch init headers instead.
+
+Workarounds
+Use the Node HTTP adapter for security-sensitive server-side requests until fixed. If the fetch adapter must be used, avoid passing empty fetchOptions objects in processes where prototype pollution is possible, and set explicit safe own values for fetch init fields.

@@ -1,0 +1,39 @@
+Summary
+A BatchingProcessor in go.opentelemetry.io/otel/sdk/log can enter a tight CPU loop when the asynchronous export buffer is full. Under exporter backpressure, attacker-driven high-volume log emission can keep the queue at or above the batch size, causing repeated immediate export retries and a denial of service through CPU exhaustion.
+
+Introduced in commit: 4af9c20
+
+Details
+NewBatchingProcessor wraps the exporter with newBufferExporter(exporter, 1) (sdk/log/batch.go:116-122), so the asynchronous export input can fill quickly when the downstream exporter blocks. The poll goroutine dequeues a batch with b.q.TryDequeue, calls b.exporter.EnqueueExport(r), and then immediately sends on b.pollTrigger whenever qLen >= b.batchSize (sdk/log/batch.go:129-165).
+
+bufferExporter.EnqueueExport is non-blocking: it sends to e.input if possible and returns false in the default case when the channel is full (sdk/log/exporter.go:221-248). TryDequeue leaves q.len unchanged when the write callback returns false (sdk/log/batch.go:289-314). Therefore, while the exporter is backpressured, EnqueueExport fails, the queue remains at or above one full batch, and the poll loop continuously retriggers itself without waiting for the ticker.
+
+PoC
+validation-artifact.zip
+
+The validation artifact contains a PoC bundle:
+
+validation-artifact.tar:main.go: PoC source.
+validation-artifact.tar:README.md: build/run notes.
+validation-artifact.tar:build_failed.log: captured build failure from the validation environment.
+The PoC configures a blocking exporter and a BatchingProcessor with WithExportMaxBatchSize(1), WithExportInterval(5*time.Second), and WithMaxQueueSize(2048). It emits 1000 records, records a CPU profile for 750 ms while the exporter is blocked, then writes /workspace/validation_artifacts/busyloop.pprof.
+
+Reproduction steps from an affected checkout at commit 4af9c20:
+
+cd /workspace/opentelemetry-go
+git checkout 4af9c20
+
+mkdir -p validation_poc/busyloop /workspace/validation_artifacts /tmp/batchingprocessor-busyloop-poc
+tar -xf /path/to/this/finding/validation-artifact.tar -C /tmp/batchingprocessor-busyloop-poc
+cp /tmp/batchingprocessor-busyloop-poc/main.go validation_poc/busyloop/main.go
+
+go build -o validation_poc/busyloop/busyloop ./validation_poc/busyloop
+./validation_poc/busyloop/busyloop
+go tool pprof -top /workspace/validation_artifacts/busyloop.pprof
+Expected program output:
+
+cpu profile written to /workspace/validation_artifacts/busyloop.pprof
+Expected profile evidence: hot functions should include (*BatchingProcessor).poll, (*queue).TryDequeue, and (*bufferExporter).EnqueueExport, showing repeated export attempts while the exporter is blocked.
+
+Impact
+This is an availability vulnerability: uncontrolled CPU consumption caused by a busy-spin retry loop. Applications using sdk/log BatchingProcessor are impacted when an attacker can cause sustained log emission and the configured exporter or downstream collector is slow, blocked, or otherwise backpressured. The impact is limited to the embedding process but can degrade or deny service for that application.

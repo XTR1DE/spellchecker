@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>IB Spellchecker</title>
+
+    <style>
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+
+            background:
+                radial-gradient(circle at 20% 10%, #252525 0, transparent 35%),
+                radial-gradient(circle at 80% 90%, #1d1d1d 0, transparent 35%),
+                #101010;
+
+            color: #eeeeee;
+            font-family: Inter, Arial, sans-serif;
+
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .app { width: min(1100px, 92vw); }
+
+        .header { margin-bottom: 24px; }
+
+        .title {
+            font-size: 32px;
+            font-weight: 700;
+            letter-spacing: -1px;
+        }
+
+        .subtitle {
+            margin-top: 6px;
+            color: #888;
+            font-size: 14px;
+        }
+
+        .panel {
+            background: rgba(25, 25, 25, 0.88);
+            border: 1px solid #303030;
+            border-radius: 18px;
+            padding: 22px;
+
+            box-shadow:
+                0 25px 80px rgba(0, 0, 0, 0.45),
+                inset 0 1px 0 rgba(255, 255, 255, 0.03);
+        }
+
+        textarea {
+            width: 100%;
+            height: 230px;
+            resize: vertical;
+
+            border: 1px solid #383838;
+            border-radius: 12px;
+
+            background: #141414;
+            color: #e8e8e8;
+
+            padding: 18px;
+
+            font-size: 16px;
+            line-height: 1.65;
+            outline: none;
+
+            transition: border-color .2s ease, box-shadow .2s ease;
+        }
+
+        textarea:focus {
+            border-color: #666;
+            box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.04);
+        }
+
+        .controls {
+            margin-top: 15px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 15px;
+        }
+
+        button {
+            position: relative;
+            overflow: hidden;
+
+            border: 0;
+            border-radius: 10px;
+
+            padding: 12px 24px;
+
+            background: #eeeeee;
+            color: #111;
+
+            font-size: 14px;
+            font-weight: 700;
+
+            cursor: pointer;
+
+            transition: transform .15s ease, box-shadow .2s ease;
+        }
+
+        button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 8px 25px rgba(255,255,255,.12);
+        }
+
+        button:active { transform: translateY(1px); }
+
+        button.loading {
+            pointer-events: none;
+            color: transparent;
+        }
+
+        button.loading::after {
+            content: "";
+            position: absolute;
+            width: 17px;
+            height: 17px;
+            top: 50%; left: 50%;
+            margin: -8px;
+
+            border: 2px solid #777;
+            border-top-color: #111;
+            border-radius: 50%;
+
+            animation: spin .7s linear infinite;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .status { color: #666; font-size: 13px; }
+
+        .result {
+            margin-top: 20px;
+            min-height: 150px;
+
+            background: #111;
+            border: 1px solid #303030;
+            border-radius: 12px;
+
+            padding: 20px;
+
+            font-size: 17px;
+            line-height: 1.8;
+
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .result.empty {
+            color: #555;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 150px;
+        }
+
+        /* ============================================================
+           TOKEN
+           ============================================================ */
+        .token {
+            position: relative;
+            border-radius: 4px;
+            padding: 2px 1px;
+            cursor: help;
+
+            background:
+                linear-gradient(
+                    90deg,
+                    color-mix(in srgb, var(--color) 18%, #111) 0%,
+                    color-mix(in srgb, var(--color) 18%, #111) 100%
+                ) no-repeat;
+
+            background-size: 0% 100%;
+            background-position: 0 0;
+
+            animation: token-appear .45s cubic-bezier(.22, 1, .36, 1) forwards;
+            transition: color .2s ease, filter .2s ease;
+        }
+
+        @keyframes token-appear {
+            from { background-size: 0% 100%; }
+            to   { background-size: 100% 100%; }
+        }
+
+        .token.visible { background-size: 100% 100%; }
+
+        .token:hover { filter: brightness(1.18); }
+
+        .token::after {
+            content: "";
+            position: absolute;
+            left: -3px; right: -3px; bottom: -2px;
+            height: 2px;
+            background: var(--color);
+            transform-origin: left;
+            transform: scaleX(0);
+            opacity: 0;
+
+            animation: token-underline .35s ease-out .15s forwards;
+        }
+
+        @keyframes token-underline {
+            to { opacity: .45; transform: scaleX(1); }
+        }
+
+        .token.visible::after {
+            opacity: .45;
+            transform: scaleX(1);
+        }
+
+        /* ============================================================
+           TOOLTIP
+           ============================================================ */
+        .token .tooltip {
+            position: absolute;
+
+            left: 50%;
+            bottom: calc(100% + 10px);
+
+            transform:
+                translateX(-50%)
+                translateY(5px)
+                scale(.96);
+
+            opacity: 0;
+            pointer-events: none;
+
+            white-space: nowrap;
+
+            padding: 7px 10px;
+
+            border-radius: 8px;
+
+            background: #1c1c1c;
+            border: 1px solid #444;
+
+            color: #eee;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: .5px;
+
+            box-shadow: 0 8px 25px rgba(0,0,0,.5);
+
+            transition: opacity .15s ease, transform .15s ease;
+
+            z-index: 10;
+        }
+
+        .token:hover .tooltip {
+            opacity: 1;
+            transform: translateX(-50%) translateY(0) scale(1);
+        }
+
+        .tooltip::after {
+            content: "";
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            margin-left: -5px;
+            border: 5px solid transparent;
+            border-top-color: #444;
+        }
+
+        .tooltip .tooltip-row {
+            display: flex;
+            gap: 6px;
+            align-items: baseline;
+            white-space: nowrap;
+        }
+
+        .tooltip .tooltip-type {
+            font-weight: 700;
+            letter-spacing: .5px;
+            color: var(--color, #eee);
+        }
+
+        .tooltip .tooltip-lemma {
+            color: #9fd4ff;
+            font-weight: 700;
+        }
+
+        .tooltip .tooltip-arrow {
+            color: #666;
+            font-weight: 400;
+        }
+
+        .tooltip .tooltip-hint {
+            display: block;
+            margin-top: 3px;
+            color: #7fb8ff;
+            font-size: 10px;
+            letter-spacing: .4px;
+            opacity: .85;
+            font-weight: 500;
+        }
+
+        /* ============================================================
+           LEGEND
+           ============================================================ */
+        .legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 15px;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+
+            padding: 5px 8px;
+            border-radius: 7px;
+            background: #191919;
+            color: #999;
+            font-size: 11px;
+        }
+
+        .legend-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--color);
+            box-shadow: 0 0 8px var(--color);
+        }
+
+        /* ============================================================
+           ЦВЕТА ТИПОВ
+           ============================================================ */
+        .type-WORD        { --color: #b59b38; }
+        .type-NUMBER      { --color: #4d7fa8; }
+        .type-URL         { --color: #4f8f5b; }
+        .type-IP          { --color: #438f7e; }
+        .type-CVE         { --color: #a95757; }
+        .type-CODE        { --color: #7662a8; }
+        .type-EMAIL       { --color: #9254a1; }
+        .type-PATH        { --color: #a8733d; }
+        .type-FILE        { --color: #a8733d; }
+        .type-PROTOCOL    { --color: #338596; }
+        .type-UNKNOWN     { --color: #686d73; }
+
+        .type-SHA         { --color: #8a6bd1; }
+        .type-HASH        { --color: #8a6bd1; }
+        .type-VERSION     { --color: #c58b3d; }
+        .type-HTTPVERSION { --color: #c58b3d; }
+        .type-TIME        { --color: #3fa3a3; }
+        .type-DATE        { --color: #3fa3a3; }
+        .type-HOSTPORT    { --color: #5f7fbf; }
+
+        /* ============================================================
+           WORD ib:true — КАНДИДАТ НА ЗАМЕНУ
+           ============================================================ */
+        .token.is-candidate {
+            --candidate: #4ea8ff;
+
+            background:
+                linear-gradient(
+                    90deg,
+                    color-mix(in srgb, var(--candidate) 22%, #111) 0%,
+                    color-mix(in srgb, var(--candidate) 22%, #111) 100%
+                ) no-repeat;
+
+            background-size: 0% 100%;
+            background-position: 0 0;
+
+            box-shadow:
+                0 0 0 1px color-mix(in srgb, var(--candidate) 65%, transparent),
+                0 0 12px color-mix(in srgb, var(--candidate) 45%, transparent);
+
+            border-radius: 5px;
+
+            animation:
+                token-appear .45s cubic-bezier(.22, 1, .36, 1) forwards,
+                candidate-pulse 2.4s ease-in-out .45s infinite;
+        }
+
+        @keyframes candidate-pulse {
+            0%, 100% {
+                box-shadow:
+                    0 0 0 1px color-mix(in srgb, var(--candidate) 65%, transparent),
+                    0 0 10px color-mix(in srgb, var(--candidate) 35%, transparent);
+            }
+            50% {
+                box-shadow:
+                    0 0 0 1px color-mix(in srgb, var(--candidate) 95%, transparent),
+                    0 0 18px color-mix(in srgb, var(--candidate) 60%, transparent);
+            }
+        }
+
+        .token.is-candidate::after {
+            background: var(--candidate);
+            opacity: .75;
+        }
+
+        .token.is-candidate:hover {
+            filter: brightness(1.25);
+        }
+
+        /* ============================================================
+           MOBILE
+           ============================================================ */
+        @media (max-width: 700px) {
+            .title { font-size: 25px; }
+            .controls { align-items: stretch; flex-direction: column; }
+            button { width: 100%; }
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="app">
+
+    <div class="header">
+        <div class="title">IB Spellchecker</div>
+        <div class="subtitle">Tokenization &amp; security entity detection</div>
+    </div>
+
+    <div class="panel">
+
+        <textarea id="input" placeholder="Вставьте текст для анализа..."></textarea>
+
+        <div class="controls">
+            <button id="checkButton">Проверить текст</button>
+            <div class="status" id="status">Готов к проверке</div>
+        </div>
+
+        <div id="result" class="result empty">
+            Здесь появится результат анализа
+        </div>
+
+        <div class="legend">
+            <div class="legend-item"><span class="legend-dot type-WORD"></span>WORD</div>
+            <div class="legend-item"><span class="legend-dot type-WORD is-candidate-legend"></span>WORD (кандидат)</div>
+            <div class="legend-item"><span class="legend-dot type-NUMBER"></span>NUMBER</div>
+            <div class="legend-item"><span class="legend-dot type-URL"></span>URL</div>
+            <div class="legend-item"><span class="legend-dot type-EMAIL"></span>EMAIL</div>
+            <div class="legend-item"><span class="legend-dot type-IP"></span>IP</div>
+            <div class="legend-item"><span class="legend-dot type-CVE"></span>CVE</div>
+            <div class="legend-item"><span class="legend-dot type-CODE"></span>CODE</div>
+            <div class="legend-item"><span class="legend-dot type-PATH"></span>PATH</div>
+            <div class="legend-item"><span class="legend-dot type-FILE"></span>FILE</div>
+            <div class="legend-item"><span class="legend-dot type-PROTOCOL"></span>PROTOCOL</div>
+            <div class="legend-item"><span class="legend-dot type-SHA"></span>SHA</div>
+            <div class="legend-item"><span class="legend-dot type-HASH"></span>HASH</div>
+            <div class="legend-item"><span class="legend-dot type-VERSION"></span>VERSION</div>
+            <div class="legend-item"><span class="legend-dot type-HTTPVERSION"></span>HTTPVERSION</div>
+            <div class="legend-item"><span class="legend-dot type-TIME"></span>TIME</div>
+            <div class="legend-item"><span class="legend-dot type-DATE"></span>DATE</div>
+            <div class="legend-item"><span class="legend-dot type-HOSTPORT"></span>HOSTPORT</div>
+            <div class="legend-item"><span class="legend-dot type-UNKNOWN"></span>UNKNOWN</div>
+        </div>
+
+    </div>
+</div>
+
+<script>
+const input  = document.getElementById("input");
+const button = document.getElementById("checkButton");
+const result = document.getElementById("result");
+const status = document.getElementById("status");
+
+/* ------------------------------------------------------------------
+   Автозагрузка примера
+------------------------------------------------------------------ */
+fetch("/example.txt")
+    .then(r => {
+        if (!r.ok) throw new Error("Не удалось загрузить example.txt");
+        return r.text();
+    })
+    .then(text => { input.value = text; })
+    .catch(err => console.error(err));
+
+button.addEventListener("click", checkText);
+
+/* ------------------------------------------------------------------
+   Основной цикл
+------------------------------------------------------------------ */
+async function checkText() {
+    const text = input.value;
+    if (!text.trim()) return;
+
+    button.classList.add("loading");
+    status.textContent = "Анализируем...";
+    result.classList.remove("empty");
+
+    try {
+        const response = await fetch(`/tokenize`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text })
+        });
+        if (!response.ok) throw new Error("Ошибка tokenize");
+
+        const tokensResponse = await fetch(`/tokens`);
+        if (!tokensResponse.ok) throw new Error("Ошибка tokens");
+
+        const tokens = await tokensResponse.json();
+
+        renderTokens(text, tokens);
+
+        const candidates = tokens.filter(
+            t => normalizeType(t.type) === "WORD" && t.ib === true
+        ).length;
+
+        status.textContent = candidates > 0
+            ? `${tokens.length} токенов · ${candidates} кандидатов`
+            : `${tokens.length} токенов`;
+
+    } catch (error) {
+        console.error(error);
+        status.textContent = "Ошибка соединения";
+        result.classList.add("empty");
+        result.textContent = "Не удалось получить ответ от сервера.";
+    } finally {
+        button.classList.remove("loading");
+    }
+}
+
+/* ------------------------------------------------------------------
+   Нормализация имени типа
+------------------------------------------------------------------ */
+function normalizeType(type) {
+    if (!type) return "UNKNOWN";
+    const t = String(type).toLowerCase();
+
+    const map = {
+        gsha: "SHA",
+        sha: "SHA",
+        hash: "HASH",
+        httpversion: "HTTPVERSION",
+        hostport: "HOSTPORT",
+        protocol: "PROTOCOL",
+        url: "URL",
+        email: "EMAIL",
+        file: "FILE",
+        path: "PATH",
+        code: "CODE",
+        cve: "CVE",
+        ip: "IP",
+        number: "NUMBER",
+        version: "VERSION",
+        time: "TIME",
+        date: "DATE",
+        word: "WORD",
+        unknown: "UNKNOWN"
+    };
+
+    return map[t] || t.toUpperCase();
+}
+
+/* ------------------------------------------------------------------
+   Отрисовка
+------------------------------------------------------------------ */
+function renderTokens(text, tokens) {
+    result.innerHTML = "";
+
+    let position = 0;
+    const chars = Array.from(text);
+    const fragment = document.createDocumentFragment();
+
+    tokens.forEach((token) => {
+        if (token.start > position) {
+            fragment.appendChild(
+                document.createTextNode(
+                    chars.slice(position, token.start).join("")
+                )
+            );
+        }
+
+        const type = normalizeType(token.type);
+        const isCandidate = type === "WORD" && token.ib === true;
+
+        const span = document.createElement("span");
+        span.className = `token type-${type}`;
+        if (isCandidate) span.classList.add("is-candidate");
+        span.textContent = chars.slice(token.start, token.end).join("");
+
+        /* ---------- тултип ---------- */
+        const tooltip = document.createElement("span");
+        tooltip.className = "tooltip";
+
+        const row = document.createElement("span");
+        row.className = "tooltip-row";
+
+        const typeEl = document.createElement("span");
+        typeEl.className = "tooltip-type";
+        typeEl.textContent = type;
+        row.appendChild(typeEl);
+
+        if (isCandidate && token.lemma) {
+            const arrow = document.createElement("span");
+            arrow.className = "tooltip-arrow";
+            arrow.textContent = "→";
+            row.appendChild(arrow);
+
+            const lemmaEl = document.createElement("span");
+            lemmaEl.className = "tooltip-lemma";
+            lemmaEl.textContent = token.lemma;
+            row.appendChild(lemmaEl);
+        }
+
+        tooltip.appendChild(row);
+
+        if (isCandidate) {
+            const hint = document.createElement("span");
+            hint.className = "tooltip-hint";
+            hint.textContent = token.lemma
+                ? "кандидат на замену"
+                : "кандидат";
+            tooltip.appendChild(hint);
+        }
+
+        span.appendChild(tooltip);
+        span.classList.add("visible");
+
+        fragment.appendChild(span);
+        position = token.end;
+    });
+
+    if (position < chars.length) {
+        fragment.appendChild(
+            document.createTextNode(chars.slice(position).join(""))
+        );
+    }
+
+    result.appendChild(fragment);
+}
+
+/* ------------------------------------------------------------------
+   Ctrl + Enter
+------------------------------------------------------------------ */
+input.addEventListener("keydown", (event) => {
+    if (event.ctrlKey && event.key === "Enter") {
+        checkText();
+    }
+});
+</script>
+
+</body>
+</html>

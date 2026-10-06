@@ -1,0 +1,144 @@
+At a glance
+
+Actor: attacker who controls the -o/--output argument to trestle author {catalog,profile,ssp}-generate (e.g. via a CI pipeline that derives the output directory from repository-controlled data)
+
+Primitive: attacker-controlled --output value reaches trestle_root / args.output write sink with only is_directory_name_allowed() (parts[0]-only task-name-collision check), not the PathSecurityValidator.validate_local_path() guard added by the CVE-2026-46345 fix
+
+Impact: arbitrary-location file write outside the trestle workspace as the process owner (8.4 High; conservative C:N variant 7.7, still High); with --force-overwrite, the attacker-chosen directory is first recursively deleted shutil.rmtree)
+
+Precondition: attacker influences the -o argument in a CI/automation pipeline or multi-tenant trestle workspace running these generate subcommands
+
+Fix: call PathSecurityValidator.validate_local_path(markdown_path, trestle_root) immediately after building markdown_path in catalog.py, ssp.py, and prof.py, mirroring the existing jinja fix
+
+Overview
+The remediation for CVE-2026-46345 / GHSA-4q5v-7g7x-j79w ("Arbitrary File Write via Path Traversal in compliance-trestle – jinja") added a new PathSecurityValidator.validate_local_path() guard and wired it into the jinja command's output path. The identical output = trestle_root / args.output write pattern in the sibling author commands — catalog-generate, profile-generate, and ssp-generate — was not updated. Those commands instead rely on is_directory_name_allowed(), a task-name-collision check that does not stop path traversal: an absolute --output or a --output whose first component is innocuous subdir/../../../...) escapes the trestle workspace and writes generated markdown under an attacker-chosen output root outside the workspace, subject to the invoking process's filesystem permissions.
+
+Impact
+Threat model. This is not a claim that a local user harms themselves by intentionally choosing an unsafe -o. The security boundary is crossed when a trusted automation job, CI workflow, shared trestle service, or wrapper invokes one of these subcommands and derives --output from repository-controlled, tenant-controlled, or otherwise untrusted data while expecting trestle to keep generated output inside the workspace. The attacker does not need local shell access to the trestle host; they only need influence over the data that the trusted automation maps into the --output argument.
+
+Primary claim (confirmed): Such an invocation writes control-markdown files outside the trestle workspace — arbitrary-location file write as the process owner. This is runtime-confirmed for catalog-generate: catalog-generate -o /tmp/TRESTLE_ESCAPE_ABS produced files outside the workspace on a v4.0.3 install while the same install blocked the equivalent jinja -o with a Security violation error. profile-generate and ssp-generate are source-confirmed siblings (identical trestle_root / args.output join, the same is_directory_name_allowed-only gate, no validate_local_path call); see Runtime-confirmed scope in the End-to-end verification below.
+
+Destructive variant --force-overwrite, source-confirmed): before generating, the force-overwrite path clears the selected output directory via clear_folder(...) trestle/core/commands/common/cmd_utils.py), which performs shutil.rmtree on that directory. Because clear_folder early-returns unless the target is an existing directory, the primitive is recursive deletion of an attacker-selected directory tree outside the workspace (e.g. wiping a directory the process owner can write), not pinpoint deletion of an arbitrary single file. This is the integrity + availability impact behind I:HA:H.
+
+Secondary (conditional) escalation: The affected population extends to every consumer that runs these generate subcommands in a CI/automation pipeline, shared/multi-tenant trestle workspace, or wrapper that forwards an externally supplied name — the same threat model GitHub/the maintainer accepted for CVE-2026-46345. Indirect code execution (e.g. overwriting a script the CI pipeline later invokes) is the bounded escalation beyond the demonstrated file-write primitive.
+
+Technical Details
+Source → Transform → Sink → Missing-guard → Result: attacker-controlled --output CLI argument → trestle_root / args.output join in catalog.pyssp.pyprof.py → CatalogAPI.write_catalog_as_markdown() writes files under the resolved path → only is_directory_name_allowed() (parts[0]-only task-name check) applied, not PathSecurityValidator.validate_local_path() → files written outside the trestle workspace.
+
+The fix is scoped to jinja.py only
+Both fix commits 247fcce2…, 7d107b3a…, "add path traversal protection and prevent SSTI in jinja templating") touch only trestle/core/commands/author/jinja.py (+ its tests). The new guard:
+
+# trestle/core/commands/author/jinja.py
+output_file = trestle_root / r_output_file
+PathSecurityValidator.validate_local_path(output_file, trestle_root)   # :229 (and :278, :297)
+validate_local_path trestle/core/remote/security.py:326) is the correct guard — it .resolve()s the path and calls relative_to(trestle_root), rejecting both .. traversal and absolute paths.
+
+The sibling generate commands were not updated
+catalog-generate, profile-generate, and ssp-generate build the output path with the same join but never call validate_local_path. The only check is is_directory_name_allowed:
+
+# trestle/core/commands/author/catalog.py:69 / ssp.py:97 / prof.py:86  (identical in all three)
+if not file_utils.is_directory_name_allowed(args.output):
+    raise TrestleError(f'{args.output} is not an allowed directory name')
+...
+markdown_path = trestle_root / args.output           # catalog.py:90 / prof.py:110 (var markdown_path); ssp.py:111 (var md_path) — same join
+is_directory_name_allowed trestle/common/file_utils.py:95) was designed to stop task names that collide with OSCAL model directories, not traversal. It inspects only parts[0]:
+
+def is_directory_name_allowed(name: str) -> bool:
+    pathed_name = pathlib.Path(name)
+    root_path = pathed_name.parts[0]
+    if root_path in const.MODEL_TYPE_TO_MODEL_DIR.values(): return False  # blocks "catalogs", "profiles", ...
+    if root_path[0] == '.':                                return False  # blocks leading "." (i.e. "../x")
+    if pathed_name.suffix != '':                           return False  # blocks names with a file suffix
+    if '__global__' in pathed_name.parts:                  return False
+    return True
+Two payloads defeat it:
+
+Absolute path — --output /tmp/pwned. parts[0] is / (not an OSCAL dir, not .-prefixed, no suffix) → allowed. trestle_root / '/tmp/pwned' collapses to /tmp/pwned (pathlib discards the left operand on absolute join).
+
+Non-leading .. — --output subdir/../../../../../../tmp/pwned. parts[0] is subdir (innocuous) → allowed. The .. segments resolve out of the workspace at write time.
+
+The validated value flows unchanged to the write sink with no further sanitisation grep for resolve()/relative_to/validate_local_path across the catalog write path returns zero hits): ControlContext.generate(..., md_root=markdown_path, ...) stores it as a dataclass field trestle/core/control_context.py:46) and CatalogAPI.write_catalog_as_markdown() calls self._context.md_root.mkdir(exist_ok=True, parents=True) trestle/core/catalog/catalog_api.py:72) then writes .md files under it.
+
+Additional unguarded siblings create, replicate)
+trestle create trestle/core/commands/create.py:95, desired_model_dir = trestle_root / plural_path / args.output) and trestle replicate replicate.py:90) have no is_directory_name_allowed check at all and accept the same absolute / .. --output. They write a structured OSCAL model file and refuse to overwrite an existing target .exists() raises), so the primitive is create-only there — lower impact than the generate commands, but the same missing-guard root cause. These are flagged as related defense-in-depth sinks sharing the root cause, not as the primary impact claim of this report.
+
+Severity note
+Metrics mirror the parent CVE-2026-46345 (8.4, AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H). I:HA:H are direct and demonstrated: out-of-workspace file creation, plus recursive shutil.rmtree of an attacker-chosen directory under --force-overwrite. C:H is proposed for consistency with the parent advisory's published score for the same out-of-workspace write boundary; however, the directly demonstrated primitive is write/overwrite rather than file read, so a conservative vector with C:N AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H) yields 7.7, still High. S:U because trestle writes as the invoking user.
+
+Why OSCAL id-validation does not prevent this
+OSCAL model ids control.id, group.id) are NCName-validated constr(regex=…)) and cannot contain /, , or a leading .., so the per-control leaf filenames grp1/ac-1.md) cannot themselves traverse. That validation does not help here: the base output root md_root = trestle_root / args.output is built from the raw, unconstrained -o/--output CLI string and is joined before those safe leaves. An absolute or non-leading.. -o escapes the workspace, and the NCName-safe leaves are written underneath the escaped root — confirmed by the PoC, where the escape occurs at md_root /tmp/TRESTLE_ESCAPE_ABS) with grp1/ac-1.md written beneath it.
+
+Reproduction
+Non-web target (Python CLI). PoC is a command sequence run against a local install of the project's current source (HEAD e22e35bd, reports as v4.0.3) — no vendor infrastructure touched.
+
+Step 1 — Set up a normal trestle workspace with a one-control catalog
+pip install -e .                      # editable install of the affected source (v4.0.3)
+mkdir /tmp/poc_ws && cd /tmp/poc_ws
+trestle init
+mkdir -p catalogs/mycat
+python3 - <<'PY'
+import uuid, json
+cat = {"catalog":{"uuid":str(uuid.uuid4()),
+  "metadata":{"title":"PoC Catalog","last-modified":"2026-01-01T00:00:00.000+00:00","version":"1.0","oscal-version":"1.0.4"},
+  "groups":[{"id":"grp1","title":"Group One","controls":[
+     {"id":"ac-1","title":"PoC Control","parts":[{"id":"ac-1_smt","name":"statement","prose":"PoC statement prose."}]}]}]}}
+json.dump(cat, open("catalogs/mycat/catalog.json","w"), indent=2)
+PY
+Step 2 — Trigger the boundary failure (absolute-path escape)
+trestle author catalog-generate -n mycat -o /tmp/TRESTLE_ESCAPE_ABS
+ls /tmp/TRESTLE_ESCAPE_ABS/grp1/ac-1.md
+Recorded output:
+
+$ ls /tmp/TRESTLE_ESCAPE_ABS/grp1/ac-1.md
+/tmp/TRESTLE_ESCAPE_ABS/grp1/ac-1.md          # written OUTSIDE /tmp/poc_ws
+$ head -3 /tmp/TRESTLE_ESCAPE_ABS/grp1/ac-1.md
+# ac-1 - \[Group One\] PoC Control
+## Control Statement
+Step 3 — Same escape via non-leading .. (defeats is_directory_name_allowed)
+trestle author catalog-generate -n mycat -o 'subdir/../../../../../../tmp/TRESTLE_ESCAPE_DOTDOT'
+ls /tmp/TRESTLE_ESCAPE_DOTDOT/grp1/ac-1.md   # -> exists, outside the workspace
+Step 4 — Differential: the patched jinja -o is blocked on the SAME install
+echo 'hello {{ 1+1 }}' > template.j2
+trestle author jinja -i template.j2 -o '/tmp/TRESTLE_JINJA_BLOCKED'
+Recorded output (fix is active; proves this is an incomplete fix, not an unpatched version):
+
+ERROR: ... Security violation: Path traversal blocked. Attempted to access
+"/tmp/TRESTLE_JINJA_BLOCKED" which is outside the trestle workspace "/tmp/poc_ws"
+# (no file created)
+catalog-generate escapes while jinja is blocked → the validate_local_path remediation was never applied to the generate commands.
+
+End-to-end verification (runtime)
+Lab setup: editable install pip install -e .) of the affected source at HEAD e22e35bd (reports as v4.0.3, the release that contains the GHSA-4q5v jinja fix). import trestle.core.commands.author.catalog resolves to the in-tree source file, confirming the run exercises HEAD, not a stale wheel.
+
+Observed end-to-end effect (not an intermediate return value): files physically written outside the workspace — /tmp/TRESTLE_ESCAPE_ABS/grp1/ac-1.md and /tmp/TRESTLE_ESCAPE_DOTDOT/grp1/ac-1.md — while /tmp/poc_ws (the trestle root) contained no such directory. Confirmed by findls.
+
+Differential control: the same install rejects the equivalent jinja -o with Security violation: Path traversal blocked … outside the trestle workspace, writing nothing. The guard exists and works in jinja; it is simply absent from the generate commands.
+
+Guard bypass, isolated: importing is_directory_name_allowed semantics and joining via pathlib confirms -o /tmp/pwned (absolute) and -o subdir/../../../tmp/pwned (innocuous leading component) both pass the check and resolve outside the root, while the naive -o ../../tmp/pwned is the only form the check stops.
+
+Runtime-confirmed scope (what was executed vs source-confirmed): the write escape is runtime-confirmed for catalog-generate (Steps 2–4 above). profile-generate and ssp-generate are source-confirmed siblings — same trestle_root / args.output join prof.py:110, ssp.py:111), same is_directory_name_allowed-only gate prof.py:86, ssp.py:97), no validate_local_path — and should be fixed in the same patch. The --force-overwrite recursive-delete primitive clear_folder → shutil.rmtree, with an early return unless the target is an existing directory) is source-confirmed; the PoC above exercises the write escape, not -fo.
+
+Suggested Fix
+Root-cause fix: Mirror the jinja fix in the three generate commands (and, for completeness, createreplicate): after constructing the output path, call the existing guard before any mkdir/write.
+
+# catalog.py / ssp.py / prof.py, immediately after markdown_path = trestle_root / args.output
+from trestle.core.remote.security import PathSecurityValidator
+PathSecurityValidator.validate_local_path(markdown_path, trestle_root)
+is_directory_name_allowed() should be retained for its original purpose (OSCAL-dir-collision prevention) but must not be relied on for traversal defence.
+
+Defense-in-depth: Harden is_directory_name_allowed to reject absolute paths pathed_name.is_absolute()) and any .. component so it provides a secondary layer even if the primary validate_local_path call is accidentally omitted in future.
+
+References
+Vendor security policy: https://github.com/oscal-compass/compliance-trestle/security/policy
+
+Submission endpoint: https://github.com/oscal-compass/compliance-trestle/security/advisories/new
+
+Parent advisory (incompletely fixed): GHSA-4q5v-7g7x-j79w / CVE-2026-46345 — "Arbitrary File Write via Path Traversal in compliance-trestle – jinja"
+
+Coordinated disclosure batch (part of the same PathSecurityValidator remediation): GHSA-gg2g-p7xc-qqmm (SSTI RCE), GHSA-g3vg-vx23-3858 (cache path traversal), GHSA-mj4x-vf5c-5xg8 (profile-import path traversal read), GHSA-w76h-q7c6-jpjp (SSRF)
+
+Fix commits (jinja-only scope): 247fcce289f60103f3d8e28d8ec51a6986b94fb6, 7d107b3ac53caca7bde97a6278b23cd739d94525
+
+Affected sinks: trestle/core/commands/author/catalog.py:69,90; author/ssp.py:97,111; author/prof.py:86,110; bypassed guard trestle/common/file_utils.py:95; write sink trestle/core/catalog/catalog_api.py:72; unused-here correct guard trestle/core/remote/security.py:326
+
+Additional unguarded siblings: trestle/core/commands/create.py:95, trestle/core/commands/replicate.py:90

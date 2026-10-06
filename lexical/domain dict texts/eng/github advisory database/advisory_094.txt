@@ -1,0 +1,69 @@
+Summary
+isInSubnet() and isHostInSubnet() accept an address of either family and compare masked binary strings without checking that both operands are the same family. Address4 pads to 32 bits and Address6 to 128, so whenever the leading bits agree the strings are equal: new Address6('a00::1').isInSubnet(new Address4('10.0.0.0/8')) is true, and new Address4('32.0.0.1').isInSubnet(new Address6('2000::/3')) is true. No IPv4 address is inside an IPv6 network, so both answers are untrue.
+
+An application that parses untrusted input as whichever family accepts it and then tests the result against a fixed-family allowlist can admit an address outside the list.
+
+Details
+Both methods are in src/common.ts:
+
+export function isInSubnet(this: Address4 | Address6, address: Address4 | Address6) {
+  if (this.subnetMask < address.subnetMask) {
+    return false;
+  }
+
+  return isHostInSubnet.call(this, address);
+}
+
+export function isHostInSubnet(this: Address4 | Address6, address: Address4 | Address6) {
+  return this.mask(address.subnetMask) === address.mask();
+}
+mask(n) returns the first n bits of the address as a string of 0 and 1, taken from a representation padded to the family's width. new Address6('a00::1').mask(8) is '00001010', and so is new Address4('10.0.0.0/8').mask(), so string equality reports containment. The signature admits either family on either side, so TypeScript raises nothing, and the v4 property on Address6 marks IPv4 notation (::ffff:10.0.0.1) rather than family, so it does not discriminate either.
+
+Which cross-family pairs coincide depends on the network's prefix length. mask(n) on an Address4 returns at most 32 bits, so an IPv6 network longer than /32 never matches an IPv4 address, and an IPv6 network of /32 or shorter matches exactly the IPv4 addresses whose leading bits equal its prefix. An IPv4 network is at most 32 bits and matches every IPv6 address whose leading bits equal its prefix.
+
+Affected versions
+<= 10.7.0. The comparison has had this shape since the methods were written, so every release is affected.
+
+Impact
+Expression	Result	Reason
+new Address6('a00::1').isInSubnet(new Address4('10.0.0.0/8'))	true	both mask to 00001010
+new Address4('10.0.0.1').isInSubnet(new Address6('a00::/8'))	true	the same bits, reversed
+new Address4('32.0.0.1').isInSubnet(new Address6('2000::/3'))	true	both begin 001
+new Address4('32.1.13.184').isInSubnet(new Address6('2001:db8::/32'))	true	the /32 spells an IPv4 address
+new Address6('cb00:7100::1').isInSubnet(new Address4('203.0.113.0/24'))	true	the /24 spells an IPv6 prefix
+new Address4('10.0.0.1').isInSubnet(new Address6('::ffff:10.0.0.0/104'))	false	/104 is longer than 32 bits
+new Address4('8.8.8.8').isInSubnet(new Address4('10.0.0.0/8'))	false	same-family control
+In the allowlist direction the check admits an address outside the list; in the denylist direction it blocks an address outside the list. What the coincidence can admit is narrow. An IPv6 allowlist of /32 or shorter admits the IPv4 addresses its prefix spells: 2001:db8::/32 admits exactly 32.1.13.184, and 2000::/3 admits 32.0.0.0/3. Those are public IPv4 addresses; the private, loopback, and link-local ranges begin with bit patterns no allocated IPv6 prefix shares. An IPv4 allowlist admits the IPv6 addresses its prefix spells, and those all sit in blocks IANA has not allocated. So a request admitted through this defect reaches an address outside the intended list, not an internal host, and the severity reflects that.
+
+Proof of concept
+npm i ip-address@10.7.0, then:
+
+const { Address4, Address6 } = require('ip-address');
+
+// An allowlist of the application's own IPv6 range, tested against whichever
+// family the input parses as.
+const allowed = new Address6('2001:db8::/32');
+
+function parse(host) {
+  return Address4.isValid(host) ? new Address4(host) : new Address6(host);
+}
+
+for (const h of ['2001:db8::1', '2001:db9::1', '32.1.13.184', '32.1.13.185']) {
+  console.log(parse(h).isInSubnet(allowed) ? 'ALLOW' : 'BLOCK', h);
+}
+On affected versions:
+
+ALLOW 2001:db8::1
+BLOCK 2001:db9::1
+ALLOW 32.1.13.184
+BLOCK 32.1.13.185
+The IPv6 rows are right. The IPv4 address whose 32 bits equal the allowlist's prefix is admitted; the one next to it is not.
+
+Remediation
+Upgrade to the patched release. In the fix, isHostInSubnet() returns false when the two addresses are of different families, and isInSubnet() inherits the answer. The methods keep accepting either family so existing call sites compile. A caller that means to compare across families converts first, with Address6.fromAddress4(), to4(), or toAddress4Nat64(): new Address6('::ffff:10.0.0.1').to4().isInSubnet(new Address4('10.0.0.0/8')) is true, as before.
+
+If you cannot upgrade immediately, compare the classes before you compare the addresses:
+
+const contained = host.constructor === network.constructor && host.isInSubnet(network);
+A note on SSRF defense
+These methods are address classifiers, not a complete SSRF defense. Regardless of this fix, a robust SSRF guard must resolve the hostname and validate the resolved IP against the socket it connects to, and account for DNS rebinding and redirects. Treat these checks as one layer, not the only one.

@@ -1,0 +1,71 @@
+Summary
+PyJWT.decode()/decode_complete() mutates a caller-supplied options dict in place whenever verify_signature is falsy, adding verify_exp/verify_nbf/verify_iat/verify_aud/verify_iss/verify_sub/verify_jti keys directly onto that object. If application code reuses the same options dict across calls (a config object, a module-level constant, a wrapper's self.options), a later call that explicitly sets verify_signature=True for a full, normal verification silently inherits the leftover verify_exp=False etc. from an earlier verify_signature=False call on the same object -- and accepts an expired, wrong-audience, wrong-issuer, or wrong-subject token as valid with no exception. Signature verification itself is unaffected; this is specifically a claims-check bypass.
+
+This is a regression of an already-fixed, closed issue: originally reported in #679 (2021), fixed in #743 (2022, via a shallow copy of options), and silently reintroduced by #1045 (merged 2025-03-05, a typing/logic refactor that dropped the 2022 shallow-copy line). It has been present since #1045 merged, so it likely shipped in several releases already in the wild.
+
+Details
+File: jwt/api_jwt.py, PyJWT._merge_options() (called from decode_complete(), which backs both jwt.decode() and jwt.decode_complete()):
+
+def _merge_options(self, options=None):
+    if options is None:
+        return self.options
+    if not options.get("verify_signature", True):
+        options["verify_exp"] = options.get("verify_exp", False)
+        options["verify_nbf"] = options.get("verify_nbf", False)
+        # ...5 more, same pattern -- all written directly onto the caller's dict
+    return {**self.options, **options}
+No dict(options) copy occurs before these writes, unlike the pre-2025-03-05 code (see #743's fix, options = dict(options or {})). Confirmed via gh api repos/jpadilla/pyjwt/commits/29fbfc36 that #1045's diff removes that line. Confirmed still present on current main via a live fetch of jwt/api_jwt.py.
+
+PoC
+Two scripts, each run twice (separate processes), identical output both times (except Python object id()), saved locally and available on request:
+
+import jwt, time
+
+INSECURE_OPTIONS = {"verify_signature": False}
+
+secret = "s3cr3t"
+expired_token = jwt.encode(
+    {"exp": int(time.time()) - 3600, "data": "x"}, secret, algorithm="HS256"
+)
+
+jwt.decode(expired_token, options=INSECURE_OPTIONS)
+print(INSECURE_OPTIONS)
+# The dict has been silently mutated with 7 new keys, including verify_exp: False.
+
+INSECURE_OPTIONS["verify_signature"] = True
+result = jwt.decode(expired_token, secret, algorithms=["HS256"], options=INSECURE_OPTIONS)
+print(result)
+# No exception raised. Expected: jwt.ExpiredSignatureError, since verify_signature=True
+# was explicitly requested on this call.
+Reproduced deterministically across 2 independent process runs.
+
+Impact
+Preconditions: the calling application must reuse a mutable options dict object across two or more decode()/decode_complete() calls with different intent (e.g. one "insecure peek" call followed by a "fully verified" call on the same dict, config object, or instance attribute). This is a real, plausible pattern but not universal; it does not affect code that constructs a fresh options dict per call.
+
+When triggered: a signed-but-expired (or wrong-aud/iss/sub/jti) token is silently accepted as fully verified, with no warning or exception. This is an authentication/claims-verification bypass, not a signature-verification bypass.
+
+Scope: regression present since PR #1045 (merged 2025-03-05), affecting every PyJWT release since then up to and including the current 2.13.0.
+
+Suggested fix: restore a shallow copy inside _merge_options() itself (rather than relying on a caller-side copy), so every caller of _merge_options is covered:
+
+def _merge_options(self, options=None):
+    if options is None:
+        return self.options
+    options = dict(options)  # never mutate the caller's dict
+    if not options.get("verify_signature", True):
+        options.setdefault("verify_exp", False)
+        options.setdefault("verify_nbf", False)
+        options.setdefault("verify_iat", False)
+        options.setdefault("verify_aud", False)
+        options.setdefault("verify_iss", False)
+        options.setdefault("verify_sub", False)
+        options.setdefault("verify_jti", False)
+    return {**self.options, **options}
+Found via a property-based audit (copy/clone independence across widely-used Python libraries); both repro scripts were written and independently re-run before this report.
+
+Maintainer update — 2026-09-08
+We reproduced the reported behavior on PyJWT 2.13.0 at source SHA 7144e4534c34810f4525dc4578a32addd8212cff. A caller-supplied mutable options mapping was modified when verify_signature was false; reusing that mapping after re-enabling signature verification could leave registered-claim checks disabled. This is a conditional claim-verification bypass, not a signature-forgery issue.
+
+A narrow fix has been prepared: PyJWT now copies the options mapping before applying defaults. Regression coverage includes decode(), decode_complete(), constructor input preservation, mutable-mapping compatibility, and reuse of an options mapping across verification modes. The focused tests pass, the full suite passes with 369 tests and 4 intentional cryptography-environment skips, and lint/format/type checks pass.
+
+The advisory remains in triage while the fix goes through release planning. The independently verified range in this investigation is 2.13.0; reports of earlier affected versions should include the exact version and reproduction details.

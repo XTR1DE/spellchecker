@@ -1,0 +1,69 @@
+Description
+Summary
+
+vm2 3.11.6 exposes the host crypto module to a NodeVM when that single builtin is allowed. The module is presented through a read-only bridge, but its functions still execute with host-process authority. crypto.setEngine() accepts a filesystem path and asks OpenSSL to dynamically load the referenced native library.
+
+An attacker whose untrusted plugin package contains a native library can therefore load that library into the host process by calling crypto.setEngine() from sandboxed JavaScript. The native library's constructor executes before OpenSSL finishes validating whether the file is a usable engine. Consequently, even the expected ERR_CRYPTO_ENGINE_UNKNOWN exception occurs only after arbitrary native code has already run.
+
+The exploit requires only the crypto builtin. It does not require fs, process, module, child_process, worker_threads, vm, inspector, unrestricted builtins, or vm2 nesting.
+
+Details
+The vulnerable boundary is the generic builtin loader. Builtins that are not specially wrapped or classified as dangerous are imported in the host realm and exposed through a recursive read-only proxy:
+
+builtins.set(key, special ? special : vm => vm.readonly(hostRequire(key)));
+Read-only prevents sandbox code from assigning properties on the module object. It does not reduce the authority of callable exports. Calls are forwarded to the original host function with bridge values converted back to host values.
+
+The crypto module includes this callable export:
+
+crypto.setEngine(enginePath)
+When enginePath names a dynamic library, OpenSSL loads that file into the current process. Operating-system dynamic loaders execute library constructors as part of loading. Engine-symbol validation happens afterward. A file does not have to become a functional cryptographic engine for its constructor to execute.
+
+The resulting exploit flow is:
+
+attacker supplies an untrusted plugin package containing a native library
+  -> host executes the plugin in NodeVM with only crypto allowed
+  -> plugin calls crypto.setEngine(pathToBundledLibrary)
+  -> vm2 forwards the call to the host crypto module
+  -> OpenSSL asks the operating-system loader to load the library
+  -> the library constructor executes native code in the host process
+  -> OpenSSL may then reject the file, but host compromise has already occurred
+This is different from merely granting JavaScript filesystem access. A plugin system commonly has to place an untrusted package on disk before running its JavaScript. The native file can therefore already exist inside that package even when the sandbox denies fs and all process-execution builtins. Allowing crypto for hashing or signature verification unexpectedly turns that inert package file into a native-code execution primitive.
+
+PoC
+The attached PoC is local and harmless. Its native library constructor creates a marker file; it does not spawn a process, open a network connection, or modify any other file.
+
+Install Node.js with OpenSSL engine support, a C compiler, and npm.
+
+In the attached poc directory, install the exact affected package:
+
+npm install --ignore-scripts
+Build the marker library.
+
+On macOS:
+
+cc -dynamiclib -O2 -o probe-engine.dylib engine_probe.c
+node poc.js ./probe-engine.dylib
+On Linux:
+
+cc -shared -fPIC -O2 -o probe-engine.so engine_probe.c
+node poc.js ./probe-engine.so
+A vulnerable result contains all of the following:
+
+the sandbox configuration lists only crypto as an allowed builtin;
+crypto.setEngine() reports ERR_CRYPTO_ENGINE_UNKNOWN or returns;
+vm2-setengine-native-marker.txt exists afterward;
+the marker contains VM2_SETENGINE_NATIVE_CODE_EXECUTED.
+The exception is not a negative result. The marker proves that the native constructor ran before engine validation failed.
+
+Impact
+This is a sandbox escape to arbitrary native code execution. The code runs with the operating-system identity and privileges of the Node.js host process, outside all vm2 language and module restrictions.
+
+An attacker can replace the marker-only constructor with native code that:
+
+reads application secrets, environment variables, credentials, and files available to the host user;
+modifies application data or executable files and establishes persistence;
+accesses internal services using the host's network identity;
+steals other tenants' data from the same process;
+terminates or corrupts the host process; and
+executes arbitrary operating-system actions permitted to the host account.
+The realistic affected workflow is a plugin, automation, notebook, or multi-tenant code runner that stores attacker-supplied package contents on disk and runs the package's JavaScript in NodeVM while allowing crypto. The attacker does not need the sandbox to expose a file-write or command-execution module.

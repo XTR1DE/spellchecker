@@ -1,0 +1,23 @@
+Summary
+Language Servers for AWS (the aws/language-servers project) provides the Language Server Protocol implementations that power AWS developer tooling, including the Amazon Q Developer agentic chat experience, across IDEs such as VS Code, JetBrains, Visual Studio, and Eclipse.
+
+Missing symlink validation in Language Servers for AWS may allow an arbitrary file write outside of the workspace trust boundary. This may occur when a local user opens a workspace containing a maliciously crafted symlink that resolves to a file path outside the workspace trust boundary.
+
+Impact
+If a user opens a maliciously crafted workspace containing a symlink that resides within the workspace but resolves to a location outside the workspace trust boundary, the agent may follow that symlink and write to the external location without prompting the user for approval. This can result in the modification of files outside the intended workspace boundary.
+
+This issue is triggered when a user opens a workspace, trusts it, and the agent subsequently writes to a path within that workspace.
+
+Impacted versions: Language Servers for AWS version <1.69.0.
+
+Patches
+This issue has been addressed in AWS Language Servers version 1.69.0. We recommend upgrading to the latest version and ensuring any forked or derivative code is patched to incorporate the new fixes.
+
+Workarounds
+No workarounds are available.
+
+References
+If you have any questions or comments about this advisory, AWS Security ask that you contact them via their vulnerability reporting page or directly via email to aws-security@amazon.com. Please do not create a public GitHub issue.
+
+Acknowledgement
+AWS Security would like to thank Wiz and Maor Dokhanian for collaborating on this issue through the coordinated vulnerability disclosure process.

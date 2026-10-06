@@ -1,0 +1,8 @@
+Impact
+Fastify decided whether to validate a request part by checking its schema for JavaScript truthiness. JSON Schema Draft 7 defines the boolean false as a valid schema that rejects every instance, but because false is falsy, a route that set body, querystring, params, or headers to false had that part left uncompiled: no validator was attached and the request reached the handler. An application that used false as a deny-all schema to make a route unreachable was therefore fully bypassed, and an unauthenticated remote client could reach the handler with any input. The same applied to the documented query alias for querystring. This is a complete bypass rather than a weak-schema issue, since false is the strongest JSON Schema assertion and must always fail.
+
+Patches
+Request-part schemas are now selected by an explicit presence check rather than truthiness, so a boolean false (or true) schema is compiled and enforced, including through the query alias. Patched in fastify 5.12.2. The fix is also included in the 6.0.0 release.
+
+Workarounds
+If upgrading is not immediately possible, express a deny-all request schema with an always-failing object schema instead of the boolean false (for example { "not": {} }), or reject the request in an onRequest hook.

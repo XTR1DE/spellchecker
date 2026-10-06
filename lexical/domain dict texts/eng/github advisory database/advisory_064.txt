@@ -1,0 +1,47 @@
+Summary
+When an @JsonIdentityInfo collection or map first creates N unresolved
+object-ID references and later resolves the same IDs in reverse order,
+jackson-databind scans the remaining pending-reference accumulator for each
+resolution. A shallow JSON document whose size grows linearly can therefore
+cause quadratic CPU work during deserialization.
+
+Details
+The affected path is forward-reference completion in
+CollectionDeserializer.CollectionReferringAccumulator.resolveForwardReference()
+and the corresponding map implementation. The implementation performs a
+linear search of the pending accumulator for every resolved object ID.
+
+The behavior is runtime-confirmed in jackson-databind 2.5.0, 2.22.1, and
+3.2.1. Current 2.22 and 3.2 source branches retained the same design when
+rechecked. A 2.4.0 control fails closed before successful reverse-order
+completion, so 2.5.0 is the conservative runtime-confirmed affected floor.
+The patched versions are: 2.18.11, 2.21.7, 2.22.3, 3.1.7 and 3.2.3.
+
+The vulnerable application must deserialize attacker-influenced JSON into an
+identity-enabled collection or map. The issue does not require deep nesting or
+syntactically unusual JSON.
+
+Suggested correction: replace repeated linear lookup/removal with a keyed
+pending-reference structure or another design that provides linear or
+amortized-linear completion. A regression should preserve input order,
+duplicate-ID behavior, and unresolved-ID errors while bounding reverse-order
+resolution work.
+
+PoC
+The proof constructs a shallow collection containing N unresolved
+@JsonIdentityInfo references followed by definitions of those same IDs in
+reverse order. Its ID class counts equals() calls, giving a deterministic
+work measure rather than a timing-dependent result.
+
+With N=2,000, affected versions perform exactly 2,003,000 ID comparisons. An
+equally sized control in which every reference is already resolved performs
+zero comparisons in the pending-reference lookup path. The run is bounded to
+a 512 MiB JVM. The result demonstrates quadratic growth: approximately
+N * (N + 1) / 2 comparisons, plus fixed setup comparisons.
+
+Impact
+An unauthenticated source that can submit JSON to an application using the
+affected identity-enabled collection or map shape can consume quadratic CPU
+and exhaust a request-time or worker-capacity budget, causing denial of
+service. The application model/configuration prerequisite is material. No
+confidentiality, integrity, code-execution, or parser-depth impact is claimed.

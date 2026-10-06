@@ -1,0 +1,10 @@
+Impact
+fastify crashes with an uncaught ERR_HTTP2_INVALID_CONNECTION_HEADERS exception when a route that registers a response trailer via reply.trailer() is served over HTTP/2. Fastify unconditionally adds the Transfer-Encoding: chunked header when a trailer is set, which is forbidden on HTTP/2, so Node.js throws while serializing the response headers. The exception is not caught and becomes an uncaughtException, terminating the Node.js process.
+
+One unauthenticated HTTP/2 request to any route that uses trailers is enough to crash the server, dropping all in-flight requests, and the request can be repeated to keep the process down. Applications are affected only when HTTP/2 is enabled (http2: true) and at least one route registers a trailer. HTTP/1.x responses are not affected.
+
+Patches
+Upgrade to fastify 5.12.5 or later.
+
+Workarounds
+Avoid registering response trailers with reply.trailer() on routes served over HTTP/2 until upgrading.

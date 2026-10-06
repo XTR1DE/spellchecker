@@ -1,0 +1,8 @@
+Impact
+undici's interceptors.dump() reads and discards response bodies up to a configurable maxSize. When a response declares a Content-Length that exceeds maxSize, the request is aborted cleanly. When a response is sent chunked (no Content-Length) and its body exceeds maxSize, it is not aborted: the interceptor ends the response early once the accumulated size reaches maxSize, and continued delivery from the parser triggers an internal assertion that is caught and turned into a request abort and connection tear-down. The application observes a misleading 200 with an empty or truncated body while the connection is disconnected. Any application using the dump interceptor against untrusted or misbehaving upstreams is affected.
+
+Patches
+Upgrade to 7.29.1 or 8.10.2. The dump interceptor now enforces maxSize on both the declared and the received body size, aborting the request with a RequestAbortedError instead of returning a truncated response.
+
+Workarounds
+None. Avoid using interceptors.dump() with untrusted upstreams until upgraded.

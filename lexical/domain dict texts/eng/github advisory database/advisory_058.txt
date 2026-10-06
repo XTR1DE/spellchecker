@@ -1,0 +1,72 @@
+Details
+Affected versions and vulnerable location
+Confirmed present on default branch main at HEAD 0089c89c94753bebbec12b956c07a1cd38740379.
+Crate version at HEAD: 0.62.4.
+Vulnerable locations on current default branch:
+russh/src/server/mod.rs:91 (pub max_auth_attempts: usize)
+russh/src/server/mod.rs:121 (default max_auth_attempts: 10)
+russh/src/server/encrypted.rs:89 (USERAUTH_REQUEST dispatch into auth handler path)
+russh/src/server/encrypted.rs:98 (self.common.auth_attempts += 1)
+russh/src/server/encrypted.rs:53 (only runtime read of auth_attempts, used for initial reject timing, not attempt limiting)
+Default-branch history check did not show a newer merged commit adding enforcement against config.max_auth_attempts.
+Reachability trace verified
+Entry point: exported server API server::run_stream in russh/src/server/mod.rs:1049.
+Session run loop in russh/src/server/session.rs processes incoming packets and calls reply(...) (server/session.rs:725).
+reply forwards encrypted packets to session.server_read_encrypted(...) (server/mod.rs:1221).
+server_read_encrypted routes USERAUTH_REQUEST to enc.server_read_auth_request(...) (server/encrypted.rs:89).
+On each request, self.common.auth_attempts += 1 executes (server/encrypted.rs:98).
+No comparison against self.common.config.max_auth_attempts is present in this runtime flow.
+PoC
+Reproduction steps and observed output
+I did not run a full server process in this environment because Rust tooling is unavailable. I verified the issue from source and command output on the audited tree.
+
+Show where max_auth_attempts appears:
+rtk rg -n "max_auth_attempts" .scratch/russh/russh/src/server/mod.rs .scratch/russh/russh/src/server/encrypted.rs .scratch/russh/russh/src/server/session.rs
+Observed:
+
+.scratch/russh/russh/src/server/mod.rs:91:    pub max_auth_attempts: usize,
+.scratch/russh/russh/src/server/mod.rs:121:            max_auth_attempts: 10,
+.scratch/russh/russh/src/server/mod.rs:148:            .field("max_auth_attempts", &self.max_auth_attempts)
+Show runtime auth-attempt handling:
+rtk rg -n "auth_attempts == 0|auth_attempts \\+= 1" .scratch/russh/russh/src/server/encrypted.rs
+Observed:
+
+53:        let initial_none_rejection_wait_until = if self.common.auth_attempts == 0 {
+98:                self.common.auth_attempts += 1;
+Show production entrypoint-to-auth path references:
+rtk rg -n "pub async fn run_stream|match reply\\(|server_read_encrypted\\(|server_read_auth_request\\(" .scratch/russh/russh/src/server/mod.rs .scratch/russh/russh/src/server/session.rs .scratch/russh/russh/src/server/encrypted.rs
+Observed:
+
+.scratch/russh/russh/src/server/encrypted.rs:89:                enc.server_read_auth_request(
+.scratch/russh/russh/src/server/session.rs:725:                            match reply(&mut self, &mut handler, &mut pkt).await {
+.scratch/russh/russh/src/server/mod.rs:1049:pub async fn run_stream<H, R>(
+.scratch/russh/russh/src/server/mod.rs:1221:    session.server_read_encrypted(handler, pkt).await
+Toolchain check:
+cargo --version
+Observed:
+
+/bin/bash: line 1: cargo: command not found
+Impact
+Attacker model
+Attacker: unauthenticated remote client with TCP reachability to a russh-backed SSH service.
+Preconditions: deployer expects server::Config.max_auth_attempts to cap attempts.
+Impact: repeated USERAUTH_REQUEST attempts continue for a single connection beyond configured limit, increasing online guessing opportunity and backend auth workload.
+Suggested fix
+Enforce max_auth_attempts in the USERAUTH_REQUEST branch before invoking auth-method handlers, and fail closed once threshold is reached.
+
+Concrete patch direction in russh/src/server/encrypted.rs:
+
+if self.common.config.max_auth_attempts > 0
+    && self.common.auth_attempts >= self.common.config.max_auth_attempts
+{
+    self.common.disconnect(
+        Disconnect::NoMoreAuthMethodsAvailable,
+        "Too many authentication attempts",
+        "",
+    )?;
+    return Ok(());
+}
+How it was found and a note on tooling
+The researcher synthesized three lens outputs, then revalidated each claim against current main: source presence and commit history, advisory overlap checks in both GitHub advisories and OSV, entrypoint-to-sink reachability, attacker-model realism, and execution-claim integrity. The researcher used gh, git, rg, and direct source inspection under .scratch/russh. Because Rust tooling is unavailable in this worker, this report is intentionally marked source-only.
+
+AI assistance was used while investigating this and while drafting this report. The finding was verified by reading the cited code at HEAD. The vulnerability was not executed it, and that limit is stated plainly above rather than left implied.

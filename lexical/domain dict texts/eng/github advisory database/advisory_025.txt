@@ -1,0 +1,20 @@
+Impact
+The generated activate (bash/zsh) and activate.fish scripts interpolate a shlex.quote-ed value into a position that quotes it a second time. The extra quotes terminate the quoted run early and leave part of the value parsed as shell code, so a path containing shell metacharacters runs commands when a user sources the activation script.
+
+activate is affected through the virtual environment's own path, on the branch that reports a relocated environment:
+
+echo "Virtual environment directory __VIRTUAL_ENV__ does not exist!" >&2
+For a destination named x'$(id)'y, shlex.quote emits 'x'"'"'$(id)'"'"'y'. The inner " closes the enclosing double quote and $(id) is left unquoted. Backtick and ; payloads reach the same result. This branch runs whenever the recorded path is absent, which is the normal case for a virtual environment copied or distributed to another machine.
+
+activate.fish is affected through the interpreter's Tcl/Tk library paths:
+
+set -gx TCL_LIBRARY '__TCL_LIBRARY__'
+shlex.quote already returns '/tcl/(cmd)/lib', so the rendered line is ''/tcl/(cmd)/lib''. fish concatenates the adjacent quoted runs and expands the (cmd) left between them. The same doubling also splits a path containing a space into two list elements, corrupting TCL_LIBRARY and TK_LIBRARY.
+
+This is the same defect class as GHSA-x78j-v8h9-3j2q, which covered activate.bat.
+
+Patches
+Fixed in 21.7.13 by moving the placeholders outside the surrounding quotes, so each value keeps only the quoting shlex.quote applied. Fix: pypa/virtualenv#3252
+
+Workarounds
+Avoid creating or distributing virtual environments whose path contains ', `, $, ;, ( or ), and inspect the generated activation script before sourcing one you did not create.

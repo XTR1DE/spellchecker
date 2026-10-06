@@ -1,0 +1,44 @@
+Summary
+PyJWT 2.13.0 contains an incomplete defense against algorithm confusion when
+an application mixes symmetric and asymmetric algorithms in one verification
+path. A public RSA, EC, or OKP JWK can be accepted as an HMAC secret when it
+is wrapped in a JWKS object, nested in an array, or represented in another
+container form that does not expose a top-level kty member.
+
+Impact
+An attacker who knows the public key material can forge HS256/HS384/HS512
+tokens if the application simultaneously:
+
+allows both HS* and asymmetric algorithms;
+passes raw public JWK/JWKS JSON as key=; and
+uses that same value as the HMAC secret.
+This can allow forged JWT claims in affected application configurations. The
+issue does not affect applications that keep symmetric and asymmetric
+verification paths separate and follow PyJWT's algorithm-selection guidance.
+
+Fix status
+The fix is on master in commit 801cd12 (fix: reject public JWK container HMAC keys). HMACAlgorithm.prepare_key now rejects public JWK members found in
+objects, arrays, nested containers, BOM/UTF variants, and recursion-limit
+inputs. It also recognizes escaped JSON member names without treating ordinary
+string values as JWKs. Ordinary JSON secrets remain accepted byte-for-byte.
+
+The change was tested with focused regression tests and the full local tox
+matrix. Available Python 3.9, 3.12, and 3.13 crypto/no-crypto suites, mypy,
+package metadata, and coverage passed; unavailable interpreters were skipped
+by the project configuration. A fresh independent Astra/max security review
+accepted the final diff with no blocking findings.
+
+The affected range is = 2.13.0. The fix is on the unreleased development
+branch; the patched version will be recorded when a released 2.x version
+containing the fix is available. This advisory is being moved to draft pending
+that release.
+
+Reporter credit
+Credit: Charles Vosburgh / Trilobyte.
+
+Original report
+The original report and reproduction package are retained in the private
+advisory record.
+
+Maintainer update — 2026-09-11
+The verified fix for this advisory is included in PyJWT 2.14.0, released on 2026-09-11 and available on PyPI. PyJWT 2.14.0 is the first release containing the fix. This advisory is now published with 2.14.0 recorded as the patched version.

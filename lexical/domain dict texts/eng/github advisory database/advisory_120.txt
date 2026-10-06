@@ -1,0 +1,8 @@
+Impact
+undici's RetryHandler can leave a response body pending indefinitely. When a retried request receives a non-retryable response after a truncated one, the original response.body held by the application is never settled, so reads such as response.body.text() hang and bodyTimeout does not fire. A malicious server can repeat this to accumulate pending promises and streams, leading to denial of service.
+
+Patches
+Patched in undici v7.29.1 and v8.10.2.
+
+Workarounds
+Impose an independent request deadline and destroy the response body when it expires. bodyTimeout alone does not prevent this.

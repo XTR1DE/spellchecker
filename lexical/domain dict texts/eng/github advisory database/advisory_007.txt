@@ -1,0 +1,81 @@
+Summary
+On Node.js 24 and newer, vm2 can expose the host node:test module to sandboxed NodeVM code when the embedder explicitly allows the node:test builtin. Sandbox code can reach that module through require('node:node:test') and call run() with attacker-controlled execArgv.
+
+node:test.run() starts a separate Node process for process-isolated test execution and forwards the supplied execArgv values to that process. Supplying --eval=<JavaScript> therefore executes arbitrary JavaScript in an unrestricted host Node process, outside the NodeVM sandbox.
+
+The PoC confirms that direct sandbox imports of fs, child_process, module, and process remain denied before the spawned process imports host fs and writes a harmless marker.
+
+Affected versions and environment
+Package: vm2
+Affected versions: >=3.9.6, <=3.11.5
+Latest reproduced version: 3.11.5
+Reproduced runtime: Node.js v24.18.0
+Exact path is not present on Node.js 22 because module.builtinModules does not expose the scheme-only node:test entry there
+Configuration prerequisite:
+require: {
+  builtin: ['node:test'],
+  external: false
+}
+The lower version boundary was tested directly: vm2@3.9.5 blocks require('node:node:test'), while vm2@3.9.6 permits the exploit path. Representative releases through 3.11.5 were also reproduced.
+
+Root cause
+The issue is a combination of builtin admission, generic host passthrough, and prefix normalization:
+
+On Node.js 24+, module.builtinModules includes the scheme-only key node:test.
+lib/builtin.js builds BUILTIN_MODULES from that array. The family-based DANGEROUS_BUILTINS protection does not include test, so node:test remains eligible.
+When the embedder explicitly allows node:test, addDefaultBuiltin() stores it through the generic loader:
+builtins.set(key, special ? special : vm => vm.readonly(hostRequire(key)));
+In lib/setup-node-sandbox.js, requireImpl() strips one node: prefix before builtin lookup:
+if (localStringPrototypeStartsWith(filename, 'node:')) {
+  id = localStringPrototypeSlice(filename, 5);
+  nmod = loadBuiltinModule(id);
+}
+Consequently, sandbox code requesting node:node:test is normalized to the stored key node:test and receives a readonly proxy to the host module.
+The readonly proxy does not make node:test.run() safe. Calls are forwarded to the host implementation, which accepts attacker-controlled execArgv for a newly spawned Node process.
+--eval=<attacker JavaScript> runs outside vm2 and has normal host builtin access.
+The doubled prefix is the reachability mechanism, but the security boundary failure is broader: the generic host-passthrough loader treats the test builtin family as safe even though its run() API can launch unrestricted Node processes.
+
+Proof of concept
+From the poc directory:
+
+npm ci --ignore-scripts --no-audit --no-fund
+node repro.js
+Expected successful result on Node.js 24+ includes:
+
+{
+  "vm2Version": "3.11.5",
+  "nodeVersion": "v24.18.0",
+  "markerExists": true,
+  "childIsDistinctProcess": true,
+  "marker": {
+    "hostCodeExecution": true
+  }
+}
+The PoC writes only host-rce-marker.json in its own directory and does not invoke a shell, contact a network service, or access third-party data.
+
+Impact
+An attacker who is intentionally permitted to execute untrusted JavaScript in the affected NodeVM configuration can escape the sandbox and execute arbitrary JavaScript under the embedder's operating-system identity.
+
+This provides the spawned process with the host user's filesystem, environment, network, and process-execution permissions. It can therefore result in complete confidentiality, integrity, and availability impact for the hosting service.
+
+Suggested remediation
+Treat the normalized test builtin family as dangerous before wildcard expansion and explicit builtin registration.
+
+For example, add test to DANGEROUS_BUILTINS so the existing prefix and family checks reject both node:test and node:test/reporters:
+
+const DANGEROUS_BUILTINS = new Set([
+  // existing entries
+  'test'
+]);
+If test helpers must be exposed, provide a sandbox-local wrapper through mock or override that does not expose run(), process isolation, execArgv, or other host process controls.
+
+Recommended regression cases:
+
+explicit builtin: ['node:test']
+wildcard builtin configurations
+require('node:test')
+require('node:node:test')
+node:test/reporters and prefixed variants
+direct low-level builtin registration
+attempts to pass --eval, --require, or --import through test-runner process options
+vm2-node-test-ghsa-submission.zip

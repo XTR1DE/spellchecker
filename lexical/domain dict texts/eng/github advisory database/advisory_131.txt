@@ -1,0 +1,8 @@
+Impact
+Any application that validates a user-supplied string with Joi.string().isoDate() can be stalled by a single request. One of the regular expressions the rule runs over the input was unanchored, so a valid ISO date followed by a long run of fractional-second digits made the regex engine restart its search from every position in the string, costing time proportional to the square of the input length. 64 KB of digits costs about 1.4 s and 256 KB about 22 s.
+
+Patches
+Upgrade to version 17.13.7 or 18.2.6 depending on your current major version.
+
+Workarounds
+None except capping the length of the string before it reaches joi.

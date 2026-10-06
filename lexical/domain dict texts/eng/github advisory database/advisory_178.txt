@@ -1,0 +1,26 @@
+Impact
+The partial-pipeline resume mechanism accepted partial_token as a bearer credential without binding it to the browser session that created it.
+
+Applications using resumable partial pipeline steps could allow an attacker to start an authentication flow, obtain a valid partial token and verification data, and cause a victim's browser to resume that attacker-controlled flow. This could authenticate the victim's browser as the attacker's account.
+
+The issue affects applications using partial pipeline steps such as mail_validation or custom steps decorated with @partial.
+
+Patches
+The issue has been fixed by binding partial pipeline resumes to the originating browser session.
+
+Users should upgrade to a patched version.
+
+Fix:
+
+python-social-auth/social-core#1816
+python-social-auth/social-docs#444
+python-social-auth/social-app-django#1009
+Workarounds
+Applications that cannot upgrade immediately should disable resumable partial pipeline steps, including mail_validation and custom steps decorated with @partial.
+
+If those flows are required, applications should avoid accepting partial resume links from untrusted contexts until a patched version can be deployed.
+
+There is no complete workaround while continuing to use the vulnerable partial-pipeline resume mechanism.
+
+Credits
+Reported through GitHub private vulnerability reporting by Liyi Zhou, Ziyue Wang, Strick, Maurice, and Chenchen Yu from the University of Sydney security research team.

