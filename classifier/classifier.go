@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -124,7 +127,7 @@ type Token struct {
 	Type  string  `json:"type"`
 	Text  string  `json:"text"`
 	Lemma *string `json:"lemma,omitempty"`
-	IB    *bool   `json:"ib,omitempty"`
+	IB    *string `json:"ib,omitempty"`
 }
 
 var lastTokens []Token
@@ -141,7 +144,59 @@ var (
 
 	jsonParser = gotreesitter.NewParser(jsonLanguage)
 	jsParser   = gotreesitter.NewParser(jsLanguage)
+
+	// DIAG-only: суммарное время gotreesitter Parse внутри parseStructuredCode.
+	parseDiagTotal       time.Duration
+	parseDiagCalls       int
+	parseDiagByLang      = map[string]time.Duration{}
+	parseDiagCallsByLang = map[string]int{}
+	// DIAG-only: статистика проб по языкам: calls/ok/miss.
+	parseDiagSpecCalls = map[string]int{}
+	parseDiagSpecOK    = map[string]int{}
+	// DIAG-only: какой anchor сработал для строки (первый совпавший).
+	// Ключ "Lang/anchor". Считаем только когда anchor matched.
+	parseDiagAnchorHits = map[string]int{}
+	// DIAG-only: по какому anchor строка ушла в Parse (тот же ключ).
+	parseDiagAnchorParse = map[string]int{}
+	// DIAG-only: по какому anchor Parse дал OK (тот же ключ).
+	parseDiagAnchorOK = map[string]int{}
+	parseDiagBytes    int64
+	parseDiagWin1     int
+	parseDiagWin2     int
+	parseDiagFull     int
+	// DIAG-only: разделение Parse vs обход дерева.
+	parseDiagParse time.Duration
+	parseDiagWalk  time.Duration
+
+	// OPT: переиспользуемые Tree-sitter парсеры по языкам.
+	// gotreesitter.Parser не потокобезопасен, но tokenize() работает
+	// в одном потоке HTTP-хендлера за раз на вызов — храним по одному
+	// парсеру на язык и переиспользуем между окнами/строками.
+	structuredParsers = map[string]*gotreesitter.Parser{}
+
+	// OPT: отрицательный кэш parseStructuredCode по (spec,start).
+	// Повторный разбор той же строки тем же языком детерминирован:
+	// miss останется miss. Кэш живёт только внутри одного tokenize()
+	// (сбрасывается в findStructuredCodeRanges), семантика не меняется.
+	structuredMissCache = map[structuredMissKey]struct{}{}
+
+	bashAssignRegexp = regexp.MustCompile(`(?:^|\s)[A-Za-z_][A-Za-z0-9_]*=`)
+	bashOptionRegexp = regexp.MustCompile(`(?:^|\s)--?[A-Za-z0-9]`)
 )
+
+type structuredMissKey struct {
+	spec  string
+	start int
+}
+
+func structuredParser(spec codeLanguageSpec) *gotreesitter.Parser {
+	if p, ok := structuredParsers[spec.Name]; ok {
+		return p
+	}
+	p := gotreesitter.NewParser(spec.Language)
+	structuredParsers[spec.Name] = p
+	return p
+}
 
 /*
 LEXICAL ENRICHMENT (POST /check, NDJSON stream)
@@ -156,6 +211,7 @@ classifier и не меняются: lexical-сервис лишь эхом во
 */
 
 const lexicalURL = "http://127.0.0.1:8091/check"
+const russianLexicalURL = "http://127.0.0.1:8092/check_rus"
 
 var lexicalClient = &http.Client{Timeout: 60 * time.Second}
 
@@ -174,49 +230,95 @@ type lemmaResult struct {
 	End   int     `json:"end"`
 	Text  string  `json:"text"`
 	Lemma *string `json:"lemma"`
-	IB    *bool   `json:"ib"`
+	IB    *string `json:"ib"`
 	Error string  `json:"error,omitempty"`
 }
 
 func enrichWords(tokens []Token) []Token {
-	// Индексы только пункту WORD; CODE/URL/PATH/CVE и остальные
-	// типы в lexical-сервис не отправляются и не изменяются.
-	indexByStart := make(map[int]int)
+	englishWords := make([]lemmaRequest, 0)
+	russianWords := make([]lemmaRequest, 0)
 
-	words := make([]lemmaRequest, 0)
+	for _, token := range tokens {
+		if token.Type != "WORD" {
+			continue
+		}
 
+		word := lemmaRequest{
+			Start: token.Start,
+			End:   token.End,
+			Text:  strings.ToLower(token.Text),
+		}
+
+		if containsLatinLetter(token.Text) {
+			englishWords = append(englishWords, word)
+			log.Printf("[ROUTE] EN text=%q start=%d end=%d", token.Text, token.Start, token.End)
+		} else {
+			russianWords = append(russianWords, word)
+			log.Printf("[ROUTE] RU text=%q start=%d end=%d", token.Text, token.Start, token.End)
+		}
+	}
+
+	log.Printf("[ROUTE] total: EN=%d RU=%d", len(englishWords), len(russianWords))
+
+	// Каждый сервис получает один batch со своими словами.
+	tokens = enrichWordBatch(tokens, englishWords, lexicalURL, "EN")
+	tokens = enrichWordBatch(tokens, russianWords, russianLexicalURL, "RU")
+
+	return tokens
+}
+
+func containsLatinLetter(s string) bool {
+	for _, r := range s {
+		if unicode.In(r, unicode.Latin) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func enrichWordBatch(
+	tokens []Token,
+	words []lemmaRequest,
+	url string,
+	service string,
+) []Token {
+	if len(words) == 0 {
+		return tokens
+	}
+
+	indexByStart := make(map[int]int, len(words))
 	for i, token := range tokens {
 		if token.Type != "WORD" {
 			continue
 		}
 
-		indexByStart[token.Start] = i
-
-		words = append(words, lemmaRequest{
-			Start: token.Start,
-			End:   token.End,
-			Text:  strings.ToLower(token.Text),
-		})
+		for _, word := range words {
+			if token.Start == word.Start {
+				indexByStart[word.Start] = i
+				break
+			}
+		}
 	}
+	log.Printf("[%s] -> POST %s words=%d", service, url, len(words))
 
-	// WORD нет — HTTP-запрос не делаем.
-	if len(words) == 0 {
-		return tokens
+	for _, word := range words {
+		log.Printf("[%s] -> text=%q start=%d end=%d",
+			service, word.Text, word.Start, word.End)
 	}
-
 	payload, err := json.Marshal(lemmaBatch{Words: words})
 	if err != nil {
-		log.Printf("[LEXICAL] marshal words: %v", err)
+		log.Printf("[%s] marshal words: %v", service, err)
 		return tokens
 	}
 
 	req, err := http.NewRequest(
 		http.MethodPost,
-		lexicalURL,
+		url,
 		bytes.NewReader(payload),
 	)
 	if err != nil {
-		log.Printf("[LEXICAL] build request: %v", err)
+		log.Printf("[%s] build request: %v", service, err)
 		return tokens
 	}
 
@@ -224,23 +326,19 @@ func enrichWords(tokens []Token) []Token {
 
 	resp, err := lexicalClient.Do(req)
 	if err != nil {
-		log.Printf("[LEXICAL] post %s: %v", lexicalURL, err)
+		log.Printf("[%s] post %s: %v", service, url, err)
 		return tokens
 	}
-
 	defer resp.Body.Close()
 
-	// 400 отдает JSON-объект {"status":"error"}, а не NDJSON:
-	// построчно его разбирать нельзя.
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-
 		log.Printf(
-			"[LEXICAL] status=%d body=%q",
+			"[%s] status=%d body=%q",
+			service,
 			resp.StatusCode,
 			string(body),
 		)
-
 		return tokens
 	}
 
@@ -249,57 +347,59 @@ func enrichWords(tokens []Token) []Token {
 
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
-
 		if len(line) == 0 {
 			continue
 		}
 
 		var result lemmaResult
-
 		if err := json.Unmarshal(line, &result); err != nil {
-			log.Printf("[LEXICAL] bad ndjson line: %v", err)
+			log.Printf("[%s] bad ndjson line: %v", service, err)
 			continue
 		}
+		lemma := "<nil>"
+		if result.Lemma != nil {
+			lemma = *result.Lemma
+		}
 
-		// Строка с error (например, пустой text) не несет
-		// lemma/ib: оставляем токен без обогащения.
+		ib := "<nil>"
+		if result.IB != nil {
+			ib = *result.IB
+		}
+
+		log.Printf("[%s] <- text=%q start=%d lemma=%q ib=%q error=%q",
+			service, result.Text, result.Start, lemma, ib, result.Error)
 		if result.Error != "" {
 			log.Printf(
-				"[LEXICAL] word error start=%d end=%d: %s",
+				"[%s] word error start=%d end=%d: %s",
+				service,
 				result.Start,
 				result.End,
 				result.Error,
 			)
-
 			continue
 		}
 
 		i, ok := indexByStart[result.Start]
 		if !ok {
 			log.Printf(
-				"[LEXICAL] unknown start=%d end=%d text=%q",
+				"[%s] unknown start=%d",
+				service,
 				result.Start,
-				result.End,
-				result.Text,
 			)
-
 			continue
 		}
 
-		// Стыковка по координатам classifier: start обязан
-		// совпасть, end/text проверяем для безопасности.
 		if tokens[i].End != result.End ||
 			strings.ToLower(tokens[i].Text) != result.Text {
-
 			log.Printf(
-				"[LEXICAL] mismatch start=%d expected=(end=%d text=%q) got=(end=%d text=%q)",
+				"[%s] mismatch start=%d expected=(end=%d text=%q) got=(end=%d text=%q)",
+				service,
 				result.Start,
 				tokens[i].End,
 				tokens[i].Text,
 				result.End,
 				result.Text,
 			)
-
 			continue
 		}
 
@@ -308,7 +408,7 @@ func enrichWords(tokens []Token) []Token {
 	}
 
 	if err := scanner.Err(); err != nil {
-		log.Printf("[LEXICAL] stream read: %v", err)
+		log.Printf("[%s] stream read: %v", service, err)
 	}
 
 	return tokens
@@ -363,13 +463,147 @@ var tokenRegexp = regexp.MustCompile(
 		`)`,
 )
 
+// DIAG-only: временный прогон "маленький vs большой текст".
+// Запуск: go run classifier.go -diag (читает static/example.txt).
+// -stress добавляет кейс x20 для проверки масштабирования.
+// Алгоритмы не меняет: только вызывает tokenize() и печатает [DIAG].
+// Для контроля семантики iter=0 каждого golden-кейса сверяется
+// с файлом diag_golden_<case>.json (первый прогон его создаёт).
+var diagFlag = flag.Bool("diag", false, "run local tokenize diagnosis")
+var stressFlag = flag.Bool("stress", false, "include x20 stress case in -diag")
+
 func main() {
+	flag.Parse()
+	if *diagFlag {
+		runDiag()
+		return
+	}
 	http.HandleFunc("/tokenize", tokenizeHandler)
 	http.HandleFunc("/tokens", tokensHandler)
 
 	println("server started on 8090")
 
 	http.ListenAndServe(":8090", nil)
+}
+
+func runDiag() {
+	// DIAG-only: пишем в файл напрямую в UTF-8, чтобы не зависеть
+	// от PowerShell-редиректа (он даёт UTF-16 и ломает чтение лога).
+	f, err := os.Create("diag_utf8.log")
+	if err != nil {
+		log.Fatalf("[DIAG] create diag_utf8.log: %v", err)
+	}
+	defer f.Close()
+	log.SetOutput(io.MultiWriter(os.Stderr, f))
+
+	diagParseCost()
+
+	baseBytes, err := os.ReadFile("static/example.txt")
+	if err != nil {
+		log.Fatalf("[DIAG] read static/example.txt: %v", err)
+	}
+	base := string(baseBytes)
+
+	smallText := "Hello world, this is a tiny prose probe with TCP/IP and version:2."
+	bigText := base
+	cases := []struct {
+		name string
+		text string
+	}{
+		{"small", smallText},
+		{"big", bigText},
+	}
+	if *stressFlag {
+		stress := base
+		for len(stress) < len(base)*20 {
+			stress += "\n" + base
+		}
+		cases = append(cases, struct {
+			name string
+			text string
+		}{"stress20", stress})
+	}
+
+	for _, tc := range cases {
+		log.Printf("[DIAG] === case=%s bytes=%d runes=%d ===", tc.name, len(tc.text), len([]rune(tc.text)))
+		for iter := 0; iter < 3; iter++ {
+			t0 := time.Now()
+			toks := tokenize(tc.text)
+			log.Printf("[DIAG] case=%s iter=%d wall=%v tokens=%d", tc.name, iter, time.Since(t0), len(toks))
+			if iter == 0 {
+				checkGolden(tc.name, toks)
+			}
+		}
+	}
+}
+
+// DIAG-only: синтетика цены Parse: один и тот же JS-фрагмент
+// парсим 1/5/20KB чтобы отделить fixed-cost вызова от O(n).
+func diagParseCost() {
+	js := codeLanguageSpecs[2]
+	snip := "const x = 1;\n"
+	for _, kb := range []int{1, 5, 20} {
+		src := strings.Repeat(snip, kb*85)
+		p := structuredParser(js)
+		t0 := time.Now()
+		tree, err := p.Parse([]byte(src))
+		d := time.Since(t0)
+		if err == nil && tree != nil {
+			tree.Release()
+		}
+		log.Printf("[DIAG] parsecost lang=JavaScript bytes=%d wall=%v", len(src), d)
+	}
+}
+
+// DIAG-only: golden-контроль семантики tokenize().
+// Первый прогон создаёт diag_golden_<case>.json, следующие сверяют.
+// Сравнение строгое: Start/End/Type/Text/Lemma/IB по порядку.
+func checkGolden(caseName string, toks []Token) {
+	path := "diag_golden_" + caseName + ".json"
+	data, err := json.Marshal(toks)
+	if err != nil {
+		log.Printf("[DIAG] golden case=%s marshal err=%v", caseName, err)
+		return
+	}
+	old, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if err := os.WriteFile(path, data, 0644); err != nil {
+				log.Printf("[DIAG] golden case=%s write err=%v", caseName, err)
+				return
+			}
+			log.Printf("[DIAG] golden case=%s created tokens=%d", caseName, len(toks))
+			return
+		}
+		log.Printf("[DIAG] golden case=%s read err=%v", caseName, err)
+		return
+	}
+	if !bytes.Equal(old, data) {
+		var prev []Token
+		if jerr := json.Unmarshal(old, &prev); jerr == nil {
+			n := len(prev)
+			if len(toks) < n {
+				n = len(toks)
+			}
+			diff := 0
+			for i := 0; i < n; i++ {
+				a, b := prev[i], toks[i]
+				lemmaEq := (a.Lemma == nil) == (b.Lemma == nil) && (a.Lemma == nil || *a.Lemma == *b.Lemma)
+				ibEq := (a.IB == nil) == (b.IB == nil) && (a.IB == nil || *a.IB == *b.IB)
+				if a.Start != b.Start || a.End != b.End || a.Type != b.Type || a.Text != b.Text || !lemmaEq || !ibEq {
+					if diff < 5 {
+						log.Printf("[DIAG] golden case=%s MISMATCH i=%d prev=%+v got=%+v", caseName, i, a, b)
+					}
+					diff++
+				}
+			}
+			log.Printf("[DIAG] golden case=%s MISMATCH prevTokens=%d gotTokens=%d diffTokens=%d", caseName, len(prev), len(toks), diff)
+			return
+		}
+		log.Printf("[DIAG] golden case=%s MISMATCH prevBytes=%d gotBytes=%d (unmarshal failed)", caseName, len(old), len(data))
+		return
+	}
+	log.Printf("[DIAG] golden case=%s OK tokens=%d", caseName, len(toks))
 }
 
 func tokenizeHandler(w http.ResponseWriter, r *http.Request) {
@@ -386,12 +620,25 @@ func tokenizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lastTokens = enrichWords(tokenize(request.Text))
+	start := time.Now()
+
+	tokens := tokenize(request.Text)
+	log.Printf("[TIME] tokenize: %v", time.Since(start))
+
+	start = time.Now()
+
+	tokens = enrichWords(tokens)
+	log.Printf("[TIME] lexical/enrich: %v", time.Since(start))
+
+	start = time.Now()
+
+	lastTokens = tokens
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 
-	json.NewEncoder(w).Encode(lastTokens)
+	err = json.NewEncoder(w).Encode(lastTokens)
+	fmt.Printf("[TIME] tokenize: %v\n", time.Since(start))
 }
 
 func tokensHandler(w http.ResponseWriter, r *http.Request) {
@@ -406,42 +653,74 @@ func tokensHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func tokenize(text string) []Token {
+	tTotal := time.Now()
+	t0 := time.Now()
 	protected := findCodeRanges(text)
+	dFindCode := time.Since(t0)
 
-	tokens := make([]Token, 0)
-
+	t0 = time.Now()
 	matches := tokenRegexp.FindAllStringIndex(text, -1)
+	dTokenRegexp := time.Since(t0)
 
+	t0 = time.Now()
+	runeIdx := buildRuneIndex(text)
+	dRuneIdx := time.Since(t0)
+
+	var dInside, dRunePos, dClassify time.Duration
+
+	tokens := make([]Token, 0, len(matches))
+
+	t0 = time.Now()
 	for _, match := range matches {
 		startByte := match[0]
 		endByte := match[1]
 
-		if isInsideCodeRange(startByte, endByte, protected) {
+		tI := time.Now()
+		inside := isInsideCodeRange(startByte, endByte, protected)
+		dInside += time.Since(tI)
+		if inside {
 			continue
 		}
 
 		value := text[startByte:endByte]
 
+		tR := time.Now()
+		rs := runeIdx[startByte]
+		re := runeIdx[endByte]
+		dRunePos += time.Since(tR)
+
+		tC := time.Now()
+		typ := classifyToken(value)
+		dClassify += time.Since(tC)
+
 		tokens = append(tokens, Token{
-			Start: runePosition(text, startByte),
-			End:   runePosition(text, endByte),
-			Type:  classifyToken(value),
+			Start: rs,
+			End:   re,
+			Type:  typ,
 			Text:  value,
 		})
 	}
+	dLoop := time.Since(t0)
 
+	t0 = time.Now()
 	for _, r := range protected {
 		tokens = append(tokens, Token{
-			Start: runePosition(text, r.Start),
-			End:   runePosition(text, r.End),
+			Start: runeIdx[r.Start],
+			End:   runeIdx[r.End],
 			Type:  r.Type,
 			Text:  text[r.Start:r.End],
 		})
 	}
+	dProtectedAppend := time.Since(t0)
 
+	t0 = time.Now()
 	sort.Slice(tokens, func(i, j int) bool {
 		return tokens[i].Start < tokens[j].Start
 	})
+	dSort := time.Since(t0)
+
+	log.Printf("[DIAG] tokenize total=%v findCodeRanges=%v tokenRegexp(FindAll)=%v runeIdx=%v loopTotal=%v {inside=%v runeLookup=%v classify=%v} protectedAppend=%v sort=%v matches=%d protected=%d tokens=%d textBytes=%d",
+		time.Since(tTotal), dFindCode, dTokenRegexp, dRuneIdx, dLoop, dInside, dRunePos, dClassify, dProtectedAppend, dSort, len(matches), len(protected), len(tokens), len(text))
 
 	return tokens
 }
@@ -681,6 +960,46 @@ func runePosition(text string, bytePosition int) int {
 	return len([]rune(text[:bytePosition]))
 }
 
+// buildRuneIndex строит таблицу byteOffset -> runeIndex за один проход.
+// runeIndex[i] = число рун в text[:i]. Длина len(text)+1, индекс валиден
+// для любого среза [0..len(text)]. Не меняет семантику: значение
+// совпадает с len([]rune(text[:pos])) для любого pos.
+func buildRuneIndex(text string) []int {
+	idx := make([]int, len(text)+1)
+	runes := 0
+	for i := 0; i < len(text); {
+		idx[i] = runes
+		// UTF-8 decode вручную: находим ширину руны по первому байту.
+		c := text[i]
+		w := 1
+		switch {
+		case c < 0x80:
+			w = 1
+		case c>>5 == 0x6:
+			w = 2
+		case c>>4 == 0xE:
+			w = 3
+		case c>>3 == 0x1E:
+			w = 4
+		default:
+			w = 1
+		}
+		if i+w > len(text) {
+			w = len(text) - i
+		}
+		// Заполняем промежуточные байты тем же значением: runePosition
+		// вызывается только на границах токенов/диапазонов (валидный UTF-8),
+		// но таблица остаётся корректной для любого pos.
+		for j := 1; j < w; j++ {
+			idx[i+j] = runes
+		}
+		i += w
+		runes++
+	}
+	idx[len(text)] = runes
+	return idx
+}
+
 /*
 findCodeRanges
 
@@ -713,31 +1032,60 @@ func debugPreview(s string) string {
 }
 
 func findCodeRanges(text string) []CodeRange {
+	tTotal := time.Now()
+	var dFenced, dBacktick, dJSON, dHTML, dPHP, dInline, dIf, dStructured, dMerge time.Duration
 	var ranges []CodeRange
 
+	t0 := time.Now()
 	// Сначала защищаем конструкции с явно известными границами.
 	ranges = append(ranges, findFencedCodeRanges(text)...)
+	dFenced = time.Since(t0)
+
+	t0 = time.Now()
 	ranges = append(ranges, findBacktickRanges(text)...)
+	dBacktick = time.Since(t0)
+
+	t0 = time.Now()
 	ranges = append(ranges, findJSONRanges(text)...)
+	dJSON = time.Since(t0)
+
+	t0 = time.Now()
 	ranges = append(ranges, findHTMLRanges(text)...)
+	dHTML = time.Since(t0)
+
+	t0 = time.Now()
 	ranges = append(ranges, findPHPBlockRanges(text)...)
+	dPHP = time.Since(t0)
 
 	// Этап 6A, уровень 1: inline сильные вызовы вида write_test(),
 	// PyEnvCfg.write(), repo.index.diff(...). Только сильное имя,
 	// уровень 2 (анализ содержимого скобок) не делаем.
+	t0 = time.Now()
 	ranges = append(ranges, findInlineStrongCallRanges(text, ranges)...)
+	dInline = time.Since(t0)
 
 	// Короткие statements: if (...) { ... } с сильным синтаксисом
 	// внутри. Отдельный if (...) без {, ;, $, оператора CODE не даёт.
+	t0 = time.Now()
 	ranges = append(ranges, findIfBlockRanges(text, ranges)...)
+	dIf = time.Since(t0)
 
 	// Только оставшийся текст отдаём структурному детектору.
+	t0 = time.Now()
 	ranges = append(
 		ranges,
 		findStructuredCodeRanges(text, ranges)...,
 	)
+	dStructured = time.Since(t0)
 
-	return mergeCodeRanges(text, ranges)
+	t0 = time.Now()
+	out := mergeCodeRanges(text, ranges)
+	dMerge = time.Since(t0)
+
+	log.Printf("[DIAG] findCodeRanges total=%v fenced=%v backtick=%v json=%v html=%v php=%v inlineStrong=%v ifBlock=%v structured=%v merge=%v inRanges=%d outRanges=%d textBytes=%d",
+		time.Since(tTotal), dFenced, dBacktick, dJSON, dHTML, dPHP, dInline, dIf, dStructured, dMerge, len(ranges), len(out), len(text))
+
+	return out
 }
 
 func findFencedCodeRanges(text string) []CodeRange {
@@ -795,19 +1143,35 @@ Tree-sitter JSON хорошо валидирует именно готовый
 JSON-фрагмент, но не должен разбирать весь отчёт.
 */
 func findJSONRanges(text string) []CodeRange {
+	tTotal := time.Now()
+	t0 := time.Now()
+	candidates := findBracketRanges(text)
+	dBrackets := time.Since(t0)
+
+	var dValid time.Duration
+	var nCandidates, nValid int
+	nCandidates = len(candidates)
+
 	var ranges []CodeRange
 
-	candidates := findBracketRanges(text)
-
+	t0 = time.Now()
 	for _, candidate := range candidates {
 		value := text[candidate.Start:candidate.End]
 
-		if isValidJSON(value) {
+		tV := time.Now()
+		ok := isValidJSON(value)
+		dValid += time.Since(tV)
+		if ok {
 			candidate.Type = "JSON"
 
 			ranges = append(ranges, candidate)
+			nValid++
 		}
 	}
+	dLoop := time.Since(t0)
+
+	log.Printf("[DIAG] json total=%v brackets=%v validLoop=%v validParse=%v candidates=%d valid=%d textBytes=%d",
+		time.Since(tTotal), dBrackets, dLoop, dValid, nCandidates, nValid, len(text))
 
 	return ranges
 }
@@ -1425,10 +1789,12 @@ STRUCTURED CODE DETECTION
 */
 
 type codeLanguageSpec struct {
-	Name      string
-	Language  *gotreesitter.Language
-	Anchors   []*regexp.Regexp
-	NodeTypes map[string]struct{}
+	Name     string
+	Language *gotreesitter.Language
+	Anchors  []*regexp.Regexp
+	// DIAG-only: имена anchor'ов параллельно Anchors для статистики miss.
+	AnchorNames []string
+	NodeTypes   map[string]struct{}
 }
 
 func nodeTypeSet(types ...string) map[string]struct{} {
@@ -1660,6 +2026,11 @@ var codeLanguageSpecs = []codeLanguageSpec{
 			bashWeakCommandAnchor,
 			bashShellAnchor,
 		},
+		AnchorNames: []string{
+			"strongCommand",
+			"weakCommand",
+			"shell",
+		},
 		NodeTypes: nodeTypeSet(
 			"command",
 			"pipeline",
@@ -1671,6 +2042,9 @@ var codeLanguageSpecs = []codeLanguageSpec{
 		Language: grammars.HtmlLanguage(),
 		Anchors: []*regexp.Regexp{
 			htmlElementAnchor,
+		},
+		AnchorNames: []string{
+			"element",
 		},
 		NodeTypes: nodeTypeSet(
 			"element",
@@ -1687,6 +2061,13 @@ var codeLanguageSpecs = []codeLanguageSpec{
 			jsClassAnchor,
 			jsImportExportAnchor,
 			jsReturnThrowAnchor,
+		},
+		AnchorNames: []string{
+			"variable",
+			"function",
+			"class",
+			"importExport",
+			"returnThrow",
 		},
 		NodeTypes: nodeTypeSet(
 			"lexical_declaration",
@@ -1716,6 +2097,12 @@ var codeLanguageSpecs = []codeLanguageSpec{
 			jsFunctionAnchor,
 			jsClassAnchor,
 			jsImportExportAnchor,
+		},
+		AnchorNames: []string{
+			"variable",
+			"function",
+			"class",
+			"importExport",
 		},
 		NodeTypes: nodeTypeSet(
 			"lexical_declaration",
@@ -1748,6 +2135,12 @@ var codeLanguageSpecs = []codeLanguageSpec{
 			pythonImportAnchor,
 			pythonFromImportAnchor,
 		},
+		AnchorNames: []string{
+			"declaration",
+			"control",
+			"import",
+			"fromImport",
+		},
 		NodeTypes: nodeTypeSet(
 			"function_definition",
 			"class_definition",
@@ -1772,6 +2165,11 @@ var codeLanguageSpecs = []codeLanguageSpec{
 			cPreprocessorAnchor,
 			cStructAnchor,
 			cFunctionAnchor,
+		},
+		AnchorNames: []string{
+			"preprocessor",
+			"struct",
+			"function",
 		},
 		NodeTypes: nodeTypeSet(
 			"function_definition",
@@ -1804,6 +2202,11 @@ var codeLanguageSpecs = []codeLanguageSpec{
 			cPreprocessorAnchor,
 			cppDeclarationAnchor,
 			cppFunctionAnchor,
+		},
+		AnchorNames: []string{
+			"preprocessor",
+			"declaration",
+			"function",
 		},
 		NodeTypes: nodeTypeSet(
 			"function_definition",
@@ -1838,6 +2241,10 @@ var codeLanguageSpecs = []codeLanguageSpec{
 			csharpDeclarationAnchor,
 			csharpMethodAnchor,
 		},
+		AnchorNames: []string{
+			"declaration",
+			"method",
+		},
 		NodeTypes: nodeTypeSet(
 			"method_declaration",
 			"class_declaration",
@@ -1861,6 +2268,10 @@ var codeLanguageSpecs = []codeLanguageSpec{
 			javaDeclarationAnchor,
 			javaMethodAnchor,
 		},
+		AnchorNames: []string{
+			"declaration",
+			"method",
+		},
 		NodeTypes: nodeTypeSet(
 			"method_declaration",
 			"class_declaration",
@@ -1883,6 +2294,10 @@ var codeLanguageSpecs = []codeLanguageSpec{
 			goDeclarationAnchor,
 			goVarConstAnchor,
 		},
+		AnchorNames: []string{
+			"declaration",
+			"varConst",
+		},
 		NodeTypes: nodeTypeSet(
 			"function_declaration",
 			"method_declaration",
@@ -1904,6 +2319,10 @@ var codeLanguageSpecs = []codeLanguageSpec{
 		Anchors: []*regexp.Regexp{
 			rustDeclarationAnchor,
 			rustLetAnchor,
+		},
+		AnchorNames: []string{
+			"declaration",
+			"let",
 		},
 		NodeTypes: nodeTypeSet(
 			"function_item",
@@ -1932,6 +2351,13 @@ var codeLanguageSpecs = []codeLanguageSpec{
 			phpAssignmentAnchor,
 			phpStatementAnchor,
 		},
+		AnchorNames: []string{
+			"function",
+			"class",
+			"control",
+			"assignment",
+			"statement",
+		},
 		NodeTypes: nodeTypeSet(
 			"function_definition",
 			"class_declaration",
@@ -1958,6 +2384,12 @@ var codeLanguageSpecs = []codeLanguageSpec{
 			rubyAssignmentAnchor,
 			rubyCallAnchor,
 		},
+		AnchorNames: []string{
+			"declaration",
+			"require",
+			"assignment",
+			"call",
+		},
 		NodeTypes: nodeTypeSet(
 			"method",
 			"class",
@@ -1980,8 +2412,15 @@ func findStructuredCodeRanges(
 	text string,
 	protected []CodeRange,
 ) []CodeRange {
+	tTotal := time.Now()
+	var dSplit, dCandidate, dProtectedCheck, dAnchors, dParse, dBashGuard time.Duration
+	var nLines, nNonEmpty, nCandidates, nParseCalls, nParseOK int
 	var ranges []CodeRange
+	// Miss-кэш живёт только внутри одного tokenize(): text разный —
+	// ключи (spec,start) нельзя переиспользовать между вызовами.
+	structuredMissCache = map[structuredMissKey]struct{}{}
 
+	t0 := time.Now()
 	lines := strings.SplitAfter(text, "\n")
 
 	lineStarts := make([]int, len(lines))
@@ -1992,6 +2431,8 @@ func findStructuredCodeRanges(
 		lineStarts[i] = offset
 		offset += len(line)
 	}
+	dSplit = time.Since(t0)
+	nLines = len(lines)
 
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
@@ -2000,20 +2441,28 @@ func findStructuredCodeRanges(
 		if raw == "" {
 			continue
 		}
+		nNonEmpty++
 
 		// CHANGED:
 		// Candidate теперь является только дешёвым предварительным
 		// фильтром. Само решение о том, похожа ли строка на конкретный
 		// язык, всё равно принимается через его anchor ниже.
-		if !isSyntaxCandidate(raw) {
+		tC := time.Now()
+		cand := isSyntaxCandidate(raw)
+		dCandidate += time.Since(tC)
+		if !cand {
 			continue
 		}
+		nCandidates++
 
-		if isLineInsideProtectedRange(
+		tP := time.Now()
+		inside := isLineInsideProtectedRange(
 			lineStarts[i],
 			lineStarts[i]+len(line),
 			protected,
-		) {
+		)
+		dProtectedCheck += time.Since(tP)
+		if inside {
 			continue
 		}
 
@@ -2026,52 +2475,78 @@ func findStructuredCodeRanges(
 		start := lineStarts[i] + startInLine
 
 		for _, spec := range codeLanguageSpecs {
+			tA := time.Now()
 			matched := matchesCodeAnchor(raw, spec.Anchors)
+			dAnchors += time.Since(tA)
 
-			log.Printf(
-				"[ANCHOR CHECK] language=%s matched=%v text=%q",
-				spec.Name,
-				matched,
-				debugPreview(raw),
-			)
+			// NOTE(DIAG): шумные per-line логи временно приглушены,
+			// чтобы не искажать замер на большом тексте.
+			// log.Printf(
+			// 	"[ANCHOR CHECK] language=%s matched=%v text=%q",
+			// 	spec.Name,
+			// 	matched,
+			// 	debugPreview(raw),
+			// )
 
 			if !matched {
 				continue
 			}
+			// DIAG-only: какой anchor сработал (порядок как в matcher).
+			anchorKey := spec.Name + "/" + matchedAnchorName(raw, spec)
+			parseDiagAnchorHits[anchorKey]++
 
 			// CHANGED:
 			// Слабые Bash-команды ("test", "echo", "cat", "id" ...)
 			// требуют дополнительного технического сигнала.
 			if spec.Name == "Bash" &&
-				bashWeakCommandAnchor.MatchString(raw) &&
-				!hasCodeSignal(raw) {
+				bashWeakCommandAnchor.MatchString(raw) {
+				tB := time.Now()
+				hasSig := hasCodeSignal(raw)
+				dBashGuard += time.Since(tB)
+				if !hasSig {
+					// log.Printf(
+					// 	"[BASH SKIP WEAK] text=%q reason=no-code-signal",
+					// 	debugPreview(raw),
+					// )
 
-				log.Printf(
-					"[BASH SKIP WEAK] text=%q reason=no-code-signal",
-					debugPreview(raw),
-				)
-
-				continue
+					continue
+				}
 			}
 
+			tPa := time.Now()
+			missKey := structuredMissKey{spec: spec.Name, start: start}
+			// DIAG-only: уход в Parse по данному anchor.
+			parseDiagAnchorParse[anchorKey]++
+			parseDiagSpecCalls[spec.Name]++
+			if _, isMiss := structuredMissCache[missKey]; isMiss {
+				dParse += time.Since(tPa)
+				continue
+			}
 			nodeType, end, ok := parseStructuredCode(
 				text,
 				start,
 				spec,
 			)
-
+			dParse += time.Since(tPa)
+			nParseCalls++
 			if !ok || end <= start {
+				structuredMissCache[missKey] = struct{}{}
 				continue
 			}
+			nParseOK++
+			// DIAG-only: Parse дал OK по данному anchor.
+			parseDiagAnchorOK[anchorKey]++
+			parseDiagSpecOK[spec.Name]++
 
-			log.Printf(
-				"[AST CODE] language=%s node=%s bytes=%d-%d text=%q",
-				spec.Name,
-				nodeType,
-				start,
-				end,
-				debugPreview(text[start:end]),
-			)
+			// log.Printf(
+			// 	"[AST CODE] language=%s node=%s bytes=%d-%d text=%q",
+			// 	spec.Name,
+			// 	nodeType,
+			// 	start,
+			// 	end,
+			// 	debugPreview(text[start:end]),
+			// )
+			_ = nodeType
 
 			ranges = append(ranges, CodeRange{
 				Start: start,
@@ -2093,6 +2568,25 @@ func findStructuredCodeRanges(
 		}
 	}
 
+	log.Printf("[DIAG] structured total=%v split=%v candidate=%v protectedCheck=%v anchors=%v parse=%v bashGuard=%v lines=%d nonEmpty=%d candidates=%d parseCalls=%d parseOK=%d ranges=%d parseTreeSitterTotal=%v parse=%v walk=%v bytes=%d win1=%d win2=%d full=%d callsByLang=%v parseByLang=%v",
+		time.Since(tTotal), dSplit, dCandidate, dProtectedCheck, dAnchors, dParse, dBashGuard, nLines, nNonEmpty, nCandidates, nParseCalls, nParseOK, len(ranges), parseDiagTotal, parseDiagParse, parseDiagWalk, parseDiagBytes, parseDiagWin1, parseDiagWin2, parseDiagFull, parseDiagCallsByLang, parseDiagByLang)
+
+	// DIAG-only: сбрасываем агрегаты, чтобы следующий вызов tokenize()
+	// не суммировал время предыдущего прогона.
+	// Итоговую miss-таблицу печатаем ДО сброса.
+	logAnchorMissStats()
+	resetAnchorMissStats()
+	parseDiagTotal = 0
+	parseDiagCalls = 0
+	parseDiagCallsByLang = map[string]int{}
+	parseDiagBytes = 0
+	parseDiagWin1 = 0
+	parseDiagWin2 = 0
+	parseDiagFull = 0
+	parseDiagParse = 0
+	parseDiagWalk = 0
+	parseDiagByLang = map[string]time.Duration{}
+
 	return ranges
 }
 
@@ -2107,6 +2601,89 @@ func matchesCodeAnchor(
 	}
 
 	return false
+}
+
+// DIAG-only: имя первого совпавшего anchor ("" если нет).
+// Порядок тот же, что в matchesCodeAnchor: первый match побеждает.
+func matchedAnchorName(line string, spec codeLanguageSpec) string {
+	for idx, anchor := range spec.Anchors {
+		if anchor.MatchString(line) {
+			if idx < len(spec.AnchorNames) {
+				return spec.AnchorNames[idx]
+			}
+			return "anchor#" + strconv.Itoa(idx)
+		}
+	}
+	return ""
+}
+
+// DIAG-only: агрегированная miss-статистика: calls/ok/miss по языкам
+// и hits/parse/ok по anchor'ам. Только лог, алгоритм не меняет.
+// calls/ok здесь — попытки parseStructuredCode (сырые Parse лежат
+// в parseDiagCallsByLang и больше из-за ретраев окон).
+func logAnchorMissStats() {
+	type specRow struct {
+		calls int
+		ok    int
+	}
+	_ = specRow{}
+	// По языкам: calls/parse берём из parseDiagCallsByLang,
+	// ok — из parseDiagSpecOK.
+	langs := map[string]struct{}{}
+	for k := range parseDiagCallsByLang {
+		langs[k] = struct{}{}
+	}
+	for k := range parseDiagSpecOK {
+		langs[k] = struct{}{}
+	}
+	keys := make([]string, 0, len(langs))
+	for k := range langs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		calls := parseDiagCallsByLang[k]
+		ok := parseDiagSpecOK[k]
+		miss := calls - ok
+		if miss < 0 {
+			miss = 0
+		}
+		log.Printf("[DIAG] miss lang=%s calls=%d ok=%d miss=%d", k, calls, ok, miss)
+	}
+	// По anchor'ам: ключ "Lang/anchor".
+	akeys := map[string]struct{}{}
+	for k := range parseDiagAnchorHits {
+		akeys[k] = struct{}{}
+	}
+	for k := range parseDiagAnchorParse {
+		akeys[k] = struct{}{}
+	}
+	for k := range parseDiagAnchorOK {
+		akeys[k] = struct{}{}
+	}
+	alist := make([]string, 0, len(akeys))
+	for k := range akeys {
+		alist = append(alist, k)
+	}
+	sort.Strings(alist)
+	for _, k := range alist {
+		hits := parseDiagAnchorHits[k]
+		parse := parseDiagAnchorParse[k]
+		ok := parseDiagAnchorOK[k]
+		miss := parse - ok
+		if miss < 0 {
+			miss = 0
+		}
+		log.Printf("[DIAG] miss anchor=%s hits=%d parse=%d ok=%d miss=%d", k, hits, parse, ok, miss)
+	}
+}
+
+func resetAnchorMissStats() {
+	parseDiagSpecCalls = map[string]int{}
+	parseDiagSpecOK = map[string]int{}
+	parseDiagAnchorHits = map[string]int{}
+	parseDiagAnchorParse = map[string]int{}
+	parseDiagAnchorOK = map[string]int{}
 }
 
 /*
@@ -2207,16 +2784,12 @@ func hasCodeSignal(line string) bool {
 	}
 
 	// Assignment.
-	if regexp.MustCompile(
-		`(?:^|\s)[A-Za-z_][A-Za-z0-9_]*=`,
-	).MatchString(line) {
+	if bashAssignRegexp.MatchString(line) {
 		return true
 	}
 
 	// Options.
-	if regexp.MustCompile(
-		`(?:^|\s)--?[A-Za-z0-9]`,
-	).MatchString(line) {
+	if bashOptionRegexp.MatchString(line) {
 		return true
 	}
 
@@ -2267,12 +2840,49 @@ func parseStructuredCode(
 	spec codeLanguageSpec,
 ) (string, int, bool) {
 
+	// OPT: парсим ограниченное окно вместо text[start:] целиком.
+	// Окно = следующие K строк от start (не байты): кодовые узлы
+	// обычно занимают единицы строк, а прозу дальше парсить незачем.
+	// Окно принимаем только если сильный узел целиком внутри и не
+	// касается границы (иначе мог быть обрезан — расширяем).
+	// Fallback до полного хвоста сохраняет старую семантику 1:1.
+	if spec.Name != "Bash" {
+		winIdx := 0
+		for _, nlines := range []int{6, 25} {
+			winIdx++
+			limit := windowLimitByLines(text, start, nlines)
+			nodeType, end, ok, truncated := parseStructuredWindow(text, start, spec, limit)
+			if ok && !truncated {
+				if winIdx == 1 {
+					parseDiagWin1++
+				} else {
+					parseDiagWin2++
+				}
+				return nodeType, end, true
+			}
+			if ok && truncated && limit == len(text)-start {
+				if winIdx == 1 {
+					parseDiagWin1++
+				} else {
+					parseDiagWin2++
+				}
+				return nodeType, end, true
+			}
+			_ = nodeType
+			_ = end
+		}
+		// Полный хвост как раньше.
+		nodeType, end, ok, _ := parseStructuredWindow(text, start, spec, len(text)-start)
+		if ok {
+			parseDiagFull++
+		}
+		return nodeType, end, ok
+	}
+
 	sourceText := text[start:]
 
-	if spec.Name == "Bash" {
-		if lineEnd := strings.IndexByte(sourceText, '\n'); lineEnd >= 0 {
-			sourceText = sourceText[:lineEnd]
-		}
+	if lineEnd := strings.IndexByte(sourceText, '\n'); lineEnd >= 0 {
+		sourceText = sourceText[:lineEnd]
 	}
 
 	targetOffset := 0
@@ -2302,9 +2912,14 @@ func parseStructuredCode(
 		return "", 0, false
 	}
 
+	tPar0 := time.Now()
 	parser := gotreesitter.NewParser(spec.Language)
 
 	tree, err := parser.Parse(source)
+	dPar := time.Since(tPar0)
+	parseDiagTotal += dPar
+	parseDiagCalls++
+	parseDiagByLang[spec.Name] += dPar
 
 	if err != nil || tree == nil {
 		return "", 0, false
@@ -2357,6 +2972,139 @@ func parseStructuredCode(
 	end := start + (nodeEnd - targetOffset)
 
 	return node.Type(spec.Language), end, true
+}
+
+// windowLimitByLines возвращает длину окна от start, покрывающую
+// следующие nlines строк (включая частичную первую). Если строк
+// меньше — возвращает остаток текста (эквивалент полного хвоста).
+func windowLimitByLines(text string, start, nlines int) int {
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(text) {
+		return 0
+	}
+	if nlines <= 0 {
+		return len(text) - start
+	}
+	pos := start
+	seen := 0
+	for pos < len(text) && seen < nlines {
+		if text[pos] == '\n' {
+			seen++
+		}
+		pos++
+	}
+	return pos - start
+}
+
+// parseStructuredWindow парсит text[start:start+limit] (или хвост, если
+// меньше) и ищет сильный узел в targetOffset. Возвращает truncated=true,
+// если узел касается границы окна: тогда окно могло его обрезать и
+// вызыватель должен расширить окно вплоть до полного хвоста.
+// При limit >= остатка поведение 1:1 совпадает со старым полным парсингом.
+func parseStructuredWindow(
+	text string,
+	start int,
+	spec codeLanguageSpec,
+	limit int,
+) (string, int, bool, bool) {
+	rest := len(text) - start
+	if rest <= 0 {
+		return "", 0, false, false
+	}
+	if limit <= 0 || limit > rest {
+		limit = rest
+	}
+	fullTail := limit == rest
+
+	sourceText := text[start : start+limit]
+
+	targetOffset := 0
+
+	// PHP-prefix решаем по полному хвосту (как раньше), а не по окну:
+	// иначе обрезанное окно могло изменить TrimSpace/anchor-проверку.
+	if spec.Name == "PHP" &&
+		!phpOpenTagAnchor.MatchString(strings.TrimSpace(text[start:])) {
+
+		const phpPrefix = "<?php\n"
+
+		sourceText = phpPrefix + sourceText
+		targetOffset = len(phpPrefix)
+	}
+
+	source := []byte(sourceText)
+
+	if len(source) == 0 {
+		return "", 0, false, false
+	}
+
+	tPar0 := time.Now()
+	parser := structuredParser(spec)
+
+	tree, err := parser.Parse(source)
+	dPar := time.Since(tPar0)
+	parseDiagTotal += dPar
+	parseDiagParse += dPar
+	parseDiagCalls++
+	parseDiagByLang[spec.Name] += dPar
+	parseDiagCallsByLang[spec.Name]++
+	parseDiagBytes += int64(len(source))
+
+	if err != nil || tree == nil {
+		return "", 0, false, !fullTail
+	}
+
+	defer tree.Release()
+
+	tW0 := time.Now()
+	root := tree.RootNode()
+
+	if root == nil {
+		parseDiagWalk += time.Since(tW0)
+		return "", 0, false, !fullTail
+	}
+
+	node := findStrongNodeAtOffset(
+		root,
+		spec.Language,
+		spec.NodeTypes,
+		targetOffset,
+	)
+
+	if node == nil {
+		parseDiagWalk += time.Since(tW0)
+		// Узла нет в этом окне: возможно, ему не хватило окна.
+		return "", 0, false, !fullTail
+	}
+	nodeErr := node.HasError()
+	nodeEnd := int(node.EndByte())
+	nodeTypeStr := ""
+	if !nodeErr {
+		nodeTypeStr = node.Type(spec.Language)
+	}
+	parseDiagWalk += time.Since(tW0)
+
+	if nodeErr {
+		return "", 0, false, !fullTail
+	}
+
+	if nodeEnd <= targetOffset ||
+		nodeEnd > len(source) {
+
+		return "", 0, false, !fullTail
+	}
+
+	// Узел упирается в границу окна: вероятно обрезан, расширяем.
+	// Запас 1 байт: nodeEnd == len(source) означает касание конца.
+	if !fullTail && nodeEnd >= len(source)-1 {
+		end := start + (nodeEnd - targetOffset)
+		return nodeTypeStr, end, true, true
+	}
+
+	end := start + (nodeEnd - targetOffset)
+
+	return nodeTypeStr, end, true, false
 }
 
 func findStrongNodeAtOffset(
@@ -2451,7 +3199,6 @@ func parseBashCommand(
 	root *gotreesitter.Node,
 	language *gotreesitter.Language,
 ) (string, int, bool) {
-
 	if root == nil {
 		return "", 0, false
 	}
@@ -2507,12 +3254,14 @@ func parseBashCommand(
 
 	commandText := string(source[startByte:commandEnd])
 
-	log.Printf(
-		"[BASH CODE RANGE] bytes=%d-%d text=%q",
-		startByte,
-		commandEnd,
-		commandText,
-	)
+	// NOTE(DIAG): приглушено на время замеров.
+	// log.Printf(
+	// 	"[BASH CODE RANGE] bytes=%d-%d text=%q",
+	// 	startByte,
+	// 	commandEnd,
+	// 	commandText,
+	// )
+	_ = commandText
 
 	return "command", start + commandEnd, true
 }

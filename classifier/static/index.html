@@ -6,413 +6,377 @@
 
     <title>IB Spellchecker</title>
 
-    <style>
-        * { box-sizing: border-box; }
+<style>
+    * { box-sizing: border-box; }
 
-        body {
-            margin: 0;
-            min-height: 100vh;
+    body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+            radial-gradient(circle at 20% 10%, #252525 0, transparent 35%),
+            radial-gradient(circle at 80% 90%, #1d1d1d 0, transparent 35%),
+            #101010;
+        color: #eeeeee;
+        font-family: Inter, Arial, sans-serif;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+    }
 
-            background:
-                radial-gradient(circle at 20% 10%, #252525 0, transparent 35%),
-                radial-gradient(circle at 80% 90%, #1d1d1d 0, transparent 35%),
-                #101010;
+    .app { width: min(1100px, 92vw); }
 
-            color: #eeeeee;
-            font-family: Inter, Arial, sans-serif;
+    .header { margin-bottom: 24px; }
 
-            display: flex;
-            justify-content: center;
-            align-items: center;
-        }
+    .title {
+        font-size: 32px;
+        font-weight: 700;
+        letter-spacing: -1px;
+    }
 
-        .app { width: min(1100px, 92vw); }
+    .subtitle {
+        margin-top: 6px;
+        color: #888;
+        font-size: 14px;
+    }
 
-        .header { margin-bottom: 24px; }
+    .panel {
+        background: rgba(25, 25, 25, 0.88);
+        border: 1px solid #303030;
+        border-radius: 18px;
+        padding: 22px;
+        box-shadow:
+            0 25px 80px rgba(0, 0, 0, 0.45),
+            inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    }
 
-        .title {
-            font-size: 32px;
-            font-weight: 700;
-            letter-spacing: -1px;
-        }
+    textarea {
+        width: 100%;
+        height: 230px;
+        resize: vertical;
+        border: 1px solid #383838;
+        border-radius: 12px;
+        background: #141414;
+        color: #e8e8e8;
+        padding: 18px;
+        font-size: 16px;
+        line-height: 1.65;
+        outline: none;
+        transition: border-color .2s ease, box-shadow .2s ease;
+    }
 
-        .subtitle {
-            margin-top: 6px;
-            color: #888;
-            font-size: 14px;
-        }
+    textarea:focus {
+        border-color: #666;
+        box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.04);
+    }
 
-        .panel {
-            background: rgba(25, 25, 25, 0.88);
-            border: 1px solid #303030;
-            border-radius: 18px;
-            padding: 22px;
+    .controls {
+        margin-top: 15px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 15px;
+    }
 
-            box-shadow:
-                0 25px 80px rgba(0, 0, 0, 0.45),
-                inset 0 1px 0 rgba(255, 255, 255, 0.03);
-        }
+    button {
+        position: relative;
+        overflow: hidden;
+        border: 0;
+        border-radius: 10px;
+        padding: 12px 24px;
+        background: #eeeeee;
+        color: #111;
+        font-size: 14px;
+        font-weight: 700;
+        cursor: pointer;
+        transition: transform .15s ease, box-shadow .2s ease;
+    }
 
-        textarea {
-            width: 100%;
-            height: 230px;
-            resize: vertical;
+    button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 25px rgba(255, 255, 255, .12);
+    }
 
-            border: 1px solid #383838;
-            border-radius: 12px;
+    button:active { transform: translateY(1px); }
 
-            background: #141414;
-            color: #e8e8e8;
+    button.loading {
+        pointer-events: none;
+        color: transparent;
+    }
 
-            padding: 18px;
+    button.loading::after {
+        content: "";
+        position: absolute;
+        width: 17px;
+        height: 17px;
+        top: 50%;
+        left: 50%;
+        margin: -8px;
+        border: 2px solid #777;
+        border-top-color: #111;
+        border-radius: 50%;
+        animation: spin .7s linear infinite;
+    }
 
-            font-size: 16px;
-            line-height: 1.65;
-            outline: none;
+    @keyframes spin {
+        to { transform: rotate(360deg); }
+    }
 
-            transition: border-color .2s ease, box-shadow .2s ease;
-        }
+    .status {
+        color: #666;
+        font-size: 13px;
+    }
 
-        textarea:focus {
-            border-color: #666;
-            box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.04);
-        }
+    .result {
+        margin-top: 20px;
+        min-height: 150px;
+        background: #111;
+        border: 1px solid #303030;
+        border-radius: 12px;
+        padding: 20px;
+        font-size: 17px;
+        line-height: 1.8;
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
 
-        .controls {
-            margin-top: 15px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 15px;
-        }
+    .result.empty {
+        color: #555;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 150px;
+    }
 
-        button {
-            position: relative;
-            overflow: hidden;
+    /* ============================================================
+       TOKEN
+       ============================================================ */
 
-            border: 0;
-            border-radius: 10px;
+    .token {
+        position: relative;
+        border-radius: 4px;
+        padding: 2px 1px;
+        cursor: help;
+        background:
+            linear-gradient(
+                90deg,
+                color-mix(in srgb, var(--color) 18%, #111) 0%,
+                color-mix(in srgb, var(--color) 18%, #111) 100%
+            ) no-repeat;
+        background-size: 100% 100%;
+        background-position: 0 0;
+        animation: token-appear .45s cubic-bezier(.22, 1, .36, 1) forwards;
+        transition: color .2s ease, filter .2s ease;
+    }
 
-            padding: 12px 24px;
+    @keyframes token-appear {
+        from { background-size: 0% 100%; }
+        to   { background-size: 100% 100%; }
+    }
 
-            background: #eeeeee;
-            color: #111;
+    .token.visible { background-size: 100% 100%; }
 
-            font-size: 14px;
-            font-weight: 700;
+    .token:hover { filter: brightness(1.18); }
 
-            cursor: pointer;
+    .token::after {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: -2px;
+        height: 2px;
+        background: var(--color);
+        transform-origin: left;
+        transform: scaleX(0);
+        opacity: 0;
+        animation: token-underline .35s ease-out .15s forwards;
+    }
 
-            transition: transform .15s ease, box-shadow .2s ease;
-        }
-
-        button:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 8px 25px rgba(255,255,255,.12);
-        }
-
-        button:active { transform: translateY(1px); }
-
-        button.loading {
-            pointer-events: none;
-            color: transparent;
-        }
-
-        button.loading::after {
-            content: "";
-            position: absolute;
-            width: 17px;
-            height: 17px;
-            top: 50%; left: 50%;
-            margin: -8px;
-
-            border: 2px solid #777;
-            border-top-color: #111;
-            border-radius: 50%;
-
-            animation: spin .7s linear infinite;
-        }
-
-        @keyframes spin { to { transform: rotate(360deg); } }
-
-        .status { color: #666; font-size: 13px; }
-
-        .result {
-            margin-top: 20px;
-            min-height: 150px;
-
-            background: #111;
-            border: 1px solid #303030;
-            border-radius: 12px;
-
-            padding: 20px;
-
-            font-size: 17px;
-            line-height: 1.8;
-
-            white-space: pre-wrap;
-            word-break: break-word;
-        }
-
-        .result.empty {
-            color: #555;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 150px;
-        }
-
-        /* ============================================================
-           TOKEN
-           ============================================================ */
-        .token {
-            position: relative;
-            border-radius: 4px;
-            padding: 2px 1px;
-            cursor: help;
-
-            background:
-                linear-gradient(
-                    90deg,
-                    color-mix(in srgb, var(--color) 18%, #111) 0%,
-                    color-mix(in srgb, var(--color) 18%, #111) 100%
-                ) no-repeat;
-
-            background-size: 0% 100%;
-            background-position: 0 0;
-
-            animation: token-appear .45s cubic-bezier(.22, 1, .36, 1) forwards;
-            transition: color .2s ease, filter .2s ease;
-        }
-
-        @keyframes token-appear {
-            from { background-size: 0% 100%; }
-            to   { background-size: 100% 100%; }
-        }
-
-        .token.visible { background-size: 100% 100%; }
-
-        .token:hover { filter: brightness(1.18); }
-
-        .token::after {
-            content: "";
-            position: absolute;
-            left: -3px; right: -3px; bottom: -2px;
-            height: 2px;
-            background: var(--color);
-            transform-origin: left;
-            transform: scaleX(0);
-            opacity: 0;
-
-            animation: token-underline .35s ease-out .15s forwards;
-        }
-
-        @keyframes token-underline {
-            to { opacity: .45; transform: scaleX(1); }
-        }
-
-        .token.visible::after {
-            opacity: .45;
+    @keyframes token-underline {
+        to {
+            opacity: .65;
             transform: scaleX(1);
         }
+    }
 
-        /* ============================================================
-           TOOLTIP
-           ============================================================ */
-        .token .tooltip {
-            position: absolute;
+    .token.visible::after {
+        opacity: .65;
+        transform: scaleX(1);
+    }
 
-            left: 50%;
-            bottom: calc(100% + 10px);
+    /* ============================================================
+       TOOLTIP
+       ============================================================ */
 
-            transform:
-                translateX(-50%)
-                translateY(5px)
-                scale(.96);
+    .token .tooltip {
+        position: absolute;
+        left: 50%;
+        bottom: calc(100% + 10px);
+        transform: translateX(-50%) translateY(5px) scale(.96);
+        opacity: 0;
+        pointer-events: none;
+        white-space: nowrap;
+        padding: 7px 10px;
+        border-radius: 8px;
+        background: #1c1c1c;
+        border: 1px solid #444;
+        color: #eee;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: .5px;
+        box-shadow: 0 8px 25px rgba(0, 0, 0, .5);
+        transition: opacity .15s ease, transform .15s ease;
+        z-index: 10;
+    }
 
-            opacity: 0;
-            pointer-events: none;
+    .token:hover .tooltip {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0) scale(1);
+    }
 
-            white-space: nowrap;
+    .tooltip::after {
+        content: "";
+        position: absolute;
+        top: 100%;
+        left: 50%;
+        margin-left: -5px;
+        border: 5px solid transparent;
+        border-top-color: #444;
+    }
 
-            padding: 7px 10px;
+    .tooltip .tooltip-row {
+        display: flex;
+        gap: 6px;
+        align-items: baseline;
+        white-space: nowrap;
+    }
 
-            border-radius: 8px;
+    .tooltip .tooltip-type {
+        font-weight: 700;
+        letter-spacing: .5px;
+        color: var(--color, #eee);
+    }
 
-            background: #1c1c1c;
-            border: 1px solid #444;
+    .tooltip .tooltip-lemma {
+        color: #9fd4ff;
+        font-weight: 700;
+    }
 
-            color: #eee;
-            font-size: 11px;
-            font-weight: 700;
-            letter-spacing: .5px;
+    .tooltip .tooltip-arrow {
+        color: #666;
+        font-weight: 400;
+    }
 
-            box-shadow: 0 8px 25px rgba(0,0,0,.5);
+    .tooltip .tooltip-hint {
+        display: block;
+        margin-top: 3px;
+        font-size: 10px;
+        letter-spacing: .4px;
+        opacity: .85;
+        font-weight: 500;
+    }
 
-            transition: opacity .15s ease, transform .15s ease;
+    .tooltip .tooltip-hint.hint-valid {
+        color: #9aa0a6;
+    }
 
-            z-index: 10;
+    .tooltip .tooltip-hint.hint-correct {
+        color: #7ee2a8;
+    }
+
+    .tooltip .tooltip-hint.hint-candidate {
+        color: #7fb8ff;
+    }
+
+    /* ============================================================
+       LEGEND
+       ============================================================ */
+
+    .legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 15px;
+    }
+
+    .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 5px 8px;
+        border-radius: 7px;
+        background: #191919;
+        color: #999;
+        font-size: 11px;
+    }
+
+    .legend-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--color);
+        box-shadow: 0 0 8px var(--color);
+    }
+
+    /* ============================================================
+       ЦВЕТА ТИПОВ ТОКЕНОВ
+       ============================================================ */
+
+    .type-WORD        { --color: #b59b38; }
+    .type-NUMBER      { --color: #4d7fa8; }
+    .type-URL         { --color: #4f8f5b; }
+    .type-IP          { --color: #438f7e; }
+    .type-CVE         { --color: #a95757; }
+    .type-CODE        { --color: #7662a8; }
+    .type-EMAIL       { --color: #9254a1; }
+    .type-PATH        { --color: #a8733d; }
+    .type-FILE        { --color: #a8733d; }
+    .type-PROTOCOL    { --color: #338596; }
+    .type-UNKNOWN     { --color: #686d73; }
+    .type-SHA         { --color: #8a6bd1; }
+    .type-HASH        { --color: #8a6bd1; }
+    .type-VERSION     { --color: #c58b3d; }
+    .type-HTTPVERSION { --color: #c58b3d; }
+    .type-TIME        { --color: #3fa3a3; }
+    .type-DATE        { --color: #3fa3a3; }
+    .type-HOSTPORT    { --color: #5f7fbf; }
+
+    /* ============================================================
+       СТАТУС ПРОВЕРКИ WORD
+       Фон остаётся жёлтым. Меняется только линия снизу.
+       ============================================================ */
+
+    /* candidate: исправление не найдено — красный */
+    .token.is-candidate::after {
+        background: #ff5b5b;
+        opacity: .9;
+    }
+
+    /* valid: слово корректно — зелёный */
+    .token.is-valid::after {
+        background: #5ddc8a;
+        opacity: .9;
+    }
+
+    /* correct: исправление найдено — синий */
+    .token.is-correct::after {
+        background: #4ea8ff;
+        opacity: .9;
+    }
+
+    /* ============================================================
+       MOBILE
+       ============================================================ */
+
+    @media (max-width: 700px) {
+        .title { font-size: 25px; }
+        .controls {
+            align-items: stretch;
+            flex-direction: column;
         }
+        button { width: 100%; }
+    }
+</style>
 
-        .token:hover .tooltip {
-            opacity: 1;
-            transform: translateX(-50%) translateY(0) scale(1);
-        }
-
-        .tooltip::after {
-            content: "";
-            position: absolute;
-            top: 100%;
-            left: 50%;
-            margin-left: -5px;
-            border: 5px solid transparent;
-            border-top-color: #444;
-        }
-
-        .tooltip .tooltip-row {
-            display: flex;
-            gap: 6px;
-            align-items: baseline;
-            white-space: nowrap;
-        }
-
-        .tooltip .tooltip-type {
-            font-weight: 700;
-            letter-spacing: .5px;
-            color: var(--color, #eee);
-        }
-
-        .tooltip .tooltip-lemma {
-            color: #9fd4ff;
-            font-weight: 700;
-        }
-
-        .tooltip .tooltip-arrow {
-            color: #666;
-            font-weight: 400;
-        }
-
-        .tooltip .tooltip-hint {
-            display: block;
-            margin-top: 3px;
-            color: #7fb8ff;
-            font-size: 10px;
-            letter-spacing: .4px;
-            opacity: .85;
-            font-weight: 500;
-        }
-
-        /* ============================================================
-           LEGEND
-           ============================================================ */
-        .legend {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin-top: 15px;
-        }
-
-        .legend-item {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-
-            padding: 5px 8px;
-            border-radius: 7px;
-            background: #191919;
-            color: #999;
-            font-size: 11px;
-        }
-
-        .legend-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: var(--color);
-            box-shadow: 0 0 8px var(--color);
-        }
-
-        /* ============================================================
-           ЦВЕТА ТИПОВ
-           ============================================================ */
-        .type-WORD        { --color: #b59b38; }
-        .type-NUMBER      { --color: #4d7fa8; }
-        .type-URL         { --color: #4f8f5b; }
-        .type-IP          { --color: #438f7e; }
-        .type-CVE         { --color: #a95757; }
-        .type-CODE        { --color: #7662a8; }
-        .type-EMAIL       { --color: #9254a1; }
-        .type-PATH        { --color: #a8733d; }
-        .type-FILE        { --color: #a8733d; }
-        .type-PROTOCOL    { --color: #338596; }
-        .type-UNKNOWN     { --color: #686d73; }
-
-        .type-SHA         { --color: #8a6bd1; }
-        .type-HASH        { --color: #8a6bd1; }
-        .type-VERSION     { --color: #c58b3d; }
-        .type-HTTPVERSION { --color: #c58b3d; }
-        .type-TIME        { --color: #3fa3a3; }
-        .type-DATE        { --color: #3fa3a3; }
-        .type-HOSTPORT    { --color: #5f7fbf; }
-
-        /* ============================================================
-           WORD ib:true — КАНДИДАТ НА ЗАМЕНУ
-           ============================================================ */
-        .token.is-candidate {
-            --candidate: #4ea8ff;
-
-            background:
-                linear-gradient(
-                    90deg,
-                    color-mix(in srgb, var(--candidate) 22%, #111) 0%,
-                    color-mix(in srgb, var(--candidate) 22%, #111) 100%
-                ) no-repeat;
-
-            background-size: 0% 100%;
-            background-position: 0 0;
-
-            box-shadow:
-                0 0 0 1px color-mix(in srgb, var(--candidate) 65%, transparent),
-                0 0 12px color-mix(in srgb, var(--candidate) 45%, transparent);
-
-            border-radius: 5px;
-
-            animation:
-                token-appear .45s cubic-bezier(.22, 1, .36, 1) forwards,
-                candidate-pulse 2.4s ease-in-out .45s infinite;
-        }
-
-        @keyframes candidate-pulse {
-            0%, 100% {
-                box-shadow:
-                    0 0 0 1px color-mix(in srgb, var(--candidate) 65%, transparent),
-                    0 0 10px color-mix(in srgb, var(--candidate) 35%, transparent);
-            }
-            50% {
-                box-shadow:
-                    0 0 0 1px color-mix(in srgb, var(--candidate) 95%, transparent),
-                    0 0 18px color-mix(in srgb, var(--candidate) 60%, transparent);
-            }
-        }
-
-        .token.is-candidate::after {
-            background: var(--candidate);
-            opacity: .75;
-        }
-
-        .token.is-candidate:hover {
-            filter: brightness(1.25);
-        }
-
-        /* ============================================================
-           MOBILE
-           ============================================================ */
-        @media (max-width: 700px) {
-            .title { font-size: 25px; }
-            .controls { align-items: stretch; flex-direction: column; }
-            button { width: 100%; }
-        }
-    </style>
 </head>
 
 <body>
@@ -439,7 +403,18 @@
 
         <div class="legend">
             <div class="legend-item"><span class="legend-dot type-WORD"></span>WORD</div>
-            <div class="legend-item"><span class="legend-dot type-WORD is-candidate-legend"></span>WORD (кандидат)</div>
+            <div class="legend-item">
+                <span class="legend-dot" style="--color:#ff5b5b"></span>
+                WORD (нет исправления)
+            </div>
+            <div class="legend-item">
+                <span class="legend-dot" style="--color:#5ddc8a"></span>
+                WORD (корректно)
+            </div>
+            <div class="legend-item">
+                <span class="legend-dot" style="--color:#4ea8ff"></span>
+                WORD (есть исправление)
+            </div>
             <div class="legend-item"><span class="legend-dot type-NUMBER"></span>NUMBER</div>
             <div class="legend-item"><span class="legend-dot type-URL"></span>URL</div>
             <div class="legend-item"><span class="legend-dot type-EMAIL"></span>EMAIL</div>
@@ -508,12 +483,18 @@ async function checkText() {
         renderTokens(text, tokens);
 
         const candidates = tokens.filter(
-            t => normalizeType(t.type) === "WORD" && t.ib === true
+            t => normalizeType(t.type) === "WORD" && t.ib === "candidate"
         ).length;
 
-        status.textContent = candidates > 0
-            ? `${tokens.length} токенов · ${candidates} кандидатов`
-            : `${tokens.length} токенов`;
+        const corrections = tokens.filter(
+            t => normalizeType(t.type) === "WORD" && t.ib === "correct"
+        ).length;
+
+        let summary = `${tokens.length} токенов`;
+        if (corrections > 0) summary += ` · ${corrections} исправлений`;
+        if (candidates  > 0) summary += ` · ${candidates} кандидатов`;
+
+        status.textContent = summary;
 
     } catch (error) {
         console.error(error);
@@ -577,11 +558,21 @@ function renderTokens(text, tokens) {
         }
 
         const type = normalizeType(token.type);
-        const isCandidate = type === "WORD" && token.ib === true;
+
+        /* ---------- статус для WORD ---------- */
+        const isWord = type === "WORD";
+        const ibStatus = isWord ? String(token.ib || "valid") : null;
+
+        const isCandidate = ibStatus === "candidate";
+        const isValid     = ibStatus === "valid";
+        const isCorrect   = ibStatus === "correct";
 
         const span = document.createElement("span");
         span.className = `token type-${type}`;
         if (isCandidate) span.classList.add("is-candidate");
+        if (isValid)     span.classList.add("is-valid");
+        if (isCorrect)   span.classList.add("is-correct");
+
         span.textContent = chars.slice(token.start, token.end).join("");
 
         /* ---------- тултип ---------- */
@@ -596,7 +587,8 @@ function renderTokens(text, tokens) {
         typeEl.textContent = type;
         row.appendChild(typeEl);
 
-        if (isCandidate && token.lemma) {
+        // стрелка + lemma для correct / candidate
+        if ((isCorrect || isCandidate) && token.lemma) {
             const arrow = document.createElement("span");
             arrow.className = "tooltip-arrow";
             arrow.textContent = "→";
@@ -610,13 +602,28 @@ function renderTokens(text, tokens) {
 
         tooltip.appendChild(row);
 
-        if (isCandidate) {
-            const hint = document.createElement("span");
-            hint.className = "tooltip-hint";
-            hint.textContent = token.lemma
-                ? "кандидат на замену"
-                : "кандидат";
-            tooltip.appendChild(hint);
+        // подпись статуса
+        if (isWord) {
+            let hintText = null;
+            let hintClass = null;
+
+            if (ibStatus === "valid") {
+                hintText  = "правильно";
+                hintClass = "hint-valid";
+            } else if (ibStatus === "correct") {
+                hintText  = "найдено исправление";
+                hintClass = "hint-correct";
+            } else if (ibStatus === "candidate") {
+                hintText  = "исправление не найдено";
+                hintClass = "hint-candidate";
+            }
+
+            if (hintText) {
+                const hint = document.createElement("span");
+                hint.className = `tooltip-hint ${hintClass}`;
+                hint.textContent = hintText;
+                tooltip.appendChild(hint);
+            }
         }
 
         span.appendChild(tooltip);
