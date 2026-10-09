@@ -225,14 +225,17 @@ type lemmaBatch struct {
 	Words []lemmaRequest `json:"words"`
 }
 
+
 type lemmaResult struct {
-	Start int     `json:"start"`
-	End   int     `json:"end"`
-	Text  string  `json:"text"`
-	Lemma *string `json:"lemma"`
-	IB    *string `json:"ib"`
-	Error string  `json:"error,omitempty"`
+	Start    int     `json:"start"`
+	End      int     `json:"end"`
+	Text     string  `json:"text"`
+	Lemma    *string `json:"lemma"`
+	IB       *string `json:"ib"`
+	Error    string  `json:"error,omitempty"`
+	Original string  `json:"original"`
 }
+
 
 func enrichWords(tokens []Token) []Token {
 	englishWords := make([]lemmaRequest, 0)
@@ -389,19 +392,28 @@ func enrichWordBatch(
 			continue
 		}
 
-		if tokens[i].End != result.End ||
-			strings.ToLower(tokens[i].Text) != result.Text {
-			log.Printf(
-				"[%s] mismatch start=%d expected=(end=%d text=%q) got=(end=%d text=%q)",
-				service,
-				result.Start,
-				tokens[i].End,
-				tokens[i].Text,
-				result.End,
-				result.Text,
-			)
-			continue
-		}
+
+expectedText := strings.ToLower(tokens[i].Text)
+resultText := result.Text
+
+if result.Original != "" {
+    resultText = result.Original
+}
+
+if tokens[i].End != result.End ||
+    expectedText != resultText {
+    log.Printf(
+        "[%s] mismatch start=%d expected=(end=%d text=%q) got=(end=%d text=%q original=%q)",
+        service,
+        result.Start,
+        tokens[i].End,
+        tokens[i].Text,
+        result.End,
+        result.Text,
+        result.Original,
+    )
+    continue
+}
 
 		tokens[i].Lemma = result.Lemma
 		tokens[i].IB = result.IB

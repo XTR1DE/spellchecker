@@ -73,6 +73,7 @@ CORRECT
 вредоносныйй
 эксплойтт
 логинитться
+<<<<<<< HEAD
 эксплуатироввать
 
 Мой «творческий путь» начался с того, что я нашел в бюджете деньги, которые правильно применил. А именно — на обучение себя. Я тогда работал на одном госпредприятии и сумел выбить из них немного денег на учебу. Оперативно отсдавал RHCSS, RHCT и RHCE. Кстати, что удивительно, эти знания пригождаются до сих пор. В этот момент меня нашел Positive Technologies.
@@ -303,3 +304,6 @@ The function returns early if the channel is unknown.
 A phrase such as if (x) may appear in the explanation without being actual code.
 
 The reviewer wrote that return 400; would be expected here, but this sentence is only describing the behavior.
+=======
+эксплуатироввать
+>>>>>>> b5a3f73 (рабочая система с UI)
