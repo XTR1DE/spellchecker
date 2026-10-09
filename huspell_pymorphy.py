@@ -547,7 +547,7 @@ class SpellChecker:
 
 if __name__ == "__main__":
 
-    # with open("data\corpus_ib.txt", "r", encoding="utf-8") as f:
+    # with open("data/corpus_ib.txt", "r", encoding="utf-8") as f:
     #     text = f.read()
     text = """
     Отчёт по инциденту ИБ-3.
