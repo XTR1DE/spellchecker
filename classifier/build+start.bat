@@ -1,34 +1,26 @@
 @echo off
-chcp 65001 > nul
+setlocal
+cd /d "%~dp0"
 
-echo Билдим сервисы...
+echo Building services...
+if not exist target mkdir target
+
 go build -o target\proxy.exe static+proxy.go
-if %errorlevel% neq 0 (
-    echo Ошибка сборки proxy.exe!
-    pause
-    exit /b
-)
+if errorlevel 1 goto build_error
 
 go build -o target\classifier.exe classifier.go
-if %errorlevel% neq 0 (
-    echo Ошибка сборки classifier.exe!
-    pause
-    exit /b
-)
+if errorlevel 1 goto build_error
 
-echo Все успешно скомпилировано в папку target!
+echo Build successful.
 
-start "Прокси-сервер :8080" target\proxy.exe
-start "Классификатор :8090" target\classifier.exe
+start "Proxy :8080" target\proxy.exe
+start "Classifier :8090" target\classifier.exe
 
+echo Services started successfully.
+timeout /t 3 /nobreak >nul
+exit /b 0
 
-echo Все сервисы успешно запущены!
-echo Это окно закроется автоматически через
-timeout /t 1 /nobreak > nul
-echo 3
-timeout /t 1 /nobreak > nul
-echo 2
-timeout /t 1 /nobreak > nul
-echo 1
-timeout /t 1 /nobreak > nul
-exit
+:build_error
+echo Build failed. Check the errors above.
+pause
+exit /b 1
