@@ -416,8 +416,7 @@ def main():
     # Подробности: только расхождения (или все слова, если VERBOSE).
     print_section("РАСХОЖДЕНИЯ С ОЖИДАЕМЫМ РЕЗУЛЬТАТОМ")
     for source, expected, corrected, logs in results:
-        if corrected == expected and not VERBOSE:
-            continue
+
         status = "✓" if corrected == expected else "✗"
         print(f"\n{status} {source}")
         if corrected != expected:
