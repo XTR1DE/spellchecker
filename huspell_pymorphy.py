@@ -171,7 +171,7 @@ def write_text_atomic(path, text):
 
 class SpellChecker:
 
-    def __init__(self):
+    def __init__(self, learning_enabled=True):
         start = time.perf_counter()
 
         # pymorphy3
@@ -204,6 +204,14 @@ class SpellChecker:
         # Кэш результатов: слово (как написано) -> (статус, исправление)
         self.cache = {}
 
+        # Диагностика для тестирования: допустимые кандидаты и статус каждого слова.
+        # На обычную работу алгоритма эти поля не влияют.
+        self.candidate_suggestions = {}
+        self.word_status = {}
+
+        # False отключает накопление кандидатов и запись словарей на диск.
+        self.learning_enabled = learning_enabled
+
         # Hunspell
         self.hunspell_calls = 0
         self.hunspell_calls_time = 0.0
@@ -230,10 +238,11 @@ class SpellChecker:
 
         self.hunspell_time = time.perf_counter() - hunspell_start
 
-        # Создаём файлы, если их ещё нет
-        if not CANDIDATES_FILE.exists():
-            self.candidates_dirty = True
-        self.save()
+        # В режиме без обучения не создаём и не изменяем файлы словарей.
+        if self.learning_enabled:
+            if not CANDIDATES_FILE.exists():
+                self.candidates_dirty = True
+            self.save()
 
         self.init_time = time.perf_counter() - start
 
@@ -398,60 +407,77 @@ class SpellChecker:
 
         return False
 
-    def pick_correction(self, key, variants, suggestions):
-        """Безопасное исправление из подсказок Hunspell (или None)."""
-        # Подсказки идут от лучшей к худшей, берём первую подходящую
+    def correction_candidates(self, key, variants, suggestions):
+        """Возвращает допустимые исправления в порядке Hunspell."""
+        result = []
         for suggestion in suggestions:
             fix = suggestion.lower()
 
-            # Ровно одна правка
+            # Подсказка должна отличаться ровно одной правкой.
             if fix not in variants:
                 continue
 
-            # Подсказка должна быть известна pymorphy3
+            # Подсказка должна быть известна pymorphy3.
             if not self.morph.word_is_known(fix):
                 continue
 
-            # Правка должна быть похожа на опечатку, а не на жаргон,
-            # случайно близкий к обычному слову
+            # Не принимаем случайно близкие слова, не похожие на опечатку.
             if STRICT_EDITS and not is_typo_edit(key, fix):
                 continue
 
-            return fix
+            if fix not in result:
+                result.append(fix)
 
-        return None
+        return result
+
+    def pick_correction(self, key, variants, suggestions):
+        """Возвращает первую допустимую подсказку Hunspell (или None)."""
+        candidates = self.correction_candidates(key, variants, suggestions)
+        return candidates[0] if candidates else None
 
     def analyze(self, word, key):
         """Полная проверка слова. Возвращает (статус, исправление)."""
         suggestions = []
+        self.candidate_suggestions[key] = []
 
         if not LATIN_ONLY.fullmatch(word):
             # Обычная лексика
             if self.morph.word_is_known(key):
+                self.word_status[key] = VALID
                 return VALID, None
 
             # Другая форма слова из ИБ-словаря
             if self.in_ib_by_lemma(key):
+                self.word_status[key] = VALID
                 return VALID, None
 
             valid, suggestions = self.hunspell_check(word)
 
             if valid:
+                self.word_status[key] = VALID
                 return VALID, None
 
         if len(key) < MIN_FIX_LEN:
+            self.word_status[key] = CANDIDATE
             return CANDIDATE, None
 
         variants = edits1(key)
 
-        fix = (
-            self.find_in_ib(key, variants)
-            or self.pick_correction(key, variants, suggestions)
-        )
-
+        # Сначала ищем однозначное совпадение в пользовательском ИБ-словаре.
+        fix = self.find_in_ib(key, variants)
         if fix:
+            self.candidate_suggestions[key] = [fix]
+            self.word_status[key] = CORRECT
             return CORRECT, fix
 
+        # Для метрик сохраняем все допустимые подсказки Hunspell в исходном порядке.
+        candidates = self.correction_candidates(key, variants, suggestions)
+        self.candidate_suggestions[key] = candidates
+        if candidates:
+            self.word_status[key] = CORRECT
+            return CORRECT, candidates[0]
+
+        self.word_status[key] = CANDIDATE
         return CANDIDATE, None
 
     def check_word(self, word):
@@ -459,6 +485,8 @@ class SpellChecker:
 
         # 1. ИБ-словарь - самая быстрая проверка (set), поэтому первая
         if key in self.ib_words:
+            self.word_status[key] = VALID
+            self.candidate_suggestions.setdefault(key, [])
             return VALID, None
 
         # 2. Кэш
@@ -467,8 +495,11 @@ class SpellChecker:
         else:
             result = self.cache[word] = self.analyze(word, key)
 
-        # Каждая встреча кандидата - это +1 к счётчику
-        if result[0] == CANDIDATE:
+        self.word_status[key] = result[0]
+
+        # Каждая встреча кандидата - это +1 к счётчику. В тестовом режиме
+        # обучение выключено, чтобы результаты не меняли ib_dictionary/candidates.
+        if result[0] == CANDIDATE and self.learning_enabled:
             self.add_candidate(key)
 
         return result
@@ -527,7 +558,8 @@ class SpellChecker:
     # ------------------------------------------------------------------
 
     def close(self):
-        self.save()
+        if self.learning_enabled:
+            self.save()
 
         if self.hunspell.poll() is None:
             try:
@@ -543,61 +575,3 @@ class SpellChecker:
     def __exit__(self, exc_type, exc, tb):
         self.close()
         return False
-
-
-if __name__ == "__main__":
-
-    # with open("data/corpus_ib.txt", "r", encoding="utf-8") as f:
-    #     text = f.read()
-    text = """
-    Отчёт по инциденту ИБ-3.
-
-Первоначально аналитик заметил подозрительный процес на серевре и несколько зафиксированны попыток авторизацыи под учеткой администраторр. Серевре находился в корпоративной сети, а ПРОЦЕС запускался каждые несколько минут. Обнаруженоо также, что процесы потребляли много памяти.
-
-На хосте нашли Mimikatz и powershel-скрипт, который собирал креды. В реестре была persistance через registri run keys, а малварь передавала payloadd на внешний адрес. Антивирус пометил файл как malvare, но EDR и SIEM сработали позже, чем ожидалось. Правило YARA совпало с сигнатурой загрузчика.
-
-Атакующий сделал брутфорс пароля, затем поднял VPN и дернул API через учётку администратора. Коннектился он каждые 30 секунд, а по логам видно несколько кредов. Кто-нибудь из команды должен проверить, какой-то ли это багфикс, или уязвимость. Фишинг тоже не исключён.
-
-Индикаторы: https://example.com/update.ps1, домен cdn-update.example.net, IP 192.168.10.25, процесс cmd.exe и CVE-2026-12345. Хэш MD5: d41d8cd98f00b204e9800998ecf8427e. Хэш SHA256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08.
-
-В обсуждении упоминались алгоритм Адлемана и работы Шамира, а также Касперский и Positive Technologies. Подозрителный файл запустили на песочнице, но результат пока неоднозначный.
-"""
-
-    with SpellChecker() as checker:
-
-        print("=" * 50)
-        print("TIME\n")
-
-        print(f"pymorphy3:  {checker.morph_time:.4f} сек.")
-        print(f"Hunspell:   {checker.hunspell_time:.4f} сек.")
-        print(f"INIT:       {checker.init_time:.4f} сек.")
-
-        calls_before = checker.hunspell_calls
-        calls_time_before = checker.hunspell_calls_time
-
-        corrected, check_time = checker.check(text)
-
-        print()
-        print("=" * 50)
-        print("RESULT\n")
-
-        for x, y in zip(corrected.split(), text.split()):
-            if x != y:
-                print(f"{y} ------> {x}")
-
-        if checker.promoted:
-            print(f"\nПеренесено в ib_dictionary: {', '.join(checker.promoted)}")
-
-        save_time = checker.save()
-
-        print()
-        print("=" * 50)
-        print("TIME\n")
-
-        print(f"CHECK:      {check_time:.4f} сек.")
-        print(f"SAVE:       {save_time:.4f} сек.")
-        print(
-            f"Hunspell:   {checker.hunspell_calls - calls_before} вызовов, "
-            f"{checker.hunspell_calls_time - calls_time_before:.4f} сек."
-        )
-        print(f"Кандидатов: {len(checker.candidates)}")
